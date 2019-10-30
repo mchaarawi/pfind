@@ -56,7 +56,8 @@ typedef struct {
   char name[PATH_MAX];
 } work_t;
 
-static DIR * open_dir = NULL;
+static dfs_obj_t * open_dir = NULL;
+static daos_anchor_t anchor = {0};
 static char open_dir_name[PATH_MAX];
 
 // queue of work
@@ -165,11 +166,16 @@ pfind_find_results_t * pfind_find(pfind_options_t * lopt){
     runtime.stonewall_endtime = 0;
   }
 
-  DIR * sd = opendir(start_dir);
-  if (err == NULL || ! sd) {
-      fprintf (stderr, "Cannot open directory '%s': %s\n", start_dir, strerror (errno));
+  dfs_obj_t * sd;
+  int rc; 
+  // = opendir(start_dir);
+  //rc = dfs_open(opt->dfs, NULL, start_dir, S_IFDIR, O_RDWR, 0, 0, NULL, &sd);
+  rc = dfs_lookup(opt->dfs, start_dir, O_RDWR, &sd, NULL, NULL);
+  if (rc) {
+      fprintf (stderr, "Cannot open directory '%s': %s\n", start_dir, strerror (rc));
       exit (EXIT_FAILURE);
   }
+  dfs_release(sd);
   start_dir_length = strlen(start_dir);
 
   // startup, load current directory
@@ -345,17 +351,17 @@ pfind_find_results_t * pfind_find(pfind_options_t * lopt){
 }
 
 pfind_find_results_t * pfind_aggregrate_results(pfind_find_results_t * local){
-  pfind_find_results_t * res = smalloc(sizeof(pfind_find_results_t));
-  if(! res){
+pfind_find_results_t * res1 = smalloc(sizeof(pfind_find_results_t));
+  if(! res1){
     pfind_abort("No memory");
   }
-  memcpy(res, local, sizeof(*res));
+  memcpy(res1, local, sizeof(*res));
 
-  MPI_Reduce(pfind_rank == 0 ? MPI_IN_PLACE : & res->errors, & res->errors, 5, MPI_LONG_LONG_INT, MPI_SUM, 0, MPI_COMM_WORLD);
-  MPI_Reduce(pfind_rank == 0 ? MPI_IN_PLACE : & res->runtime, & res->runtime, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+  MPI_Reduce(pfind_rank == 0 ? MPI_IN_PLACE : & res1->errors, & res1->errors, 5, MPI_LONG_LONG_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+  MPI_Reduce(pfind_rank == 0 ? MPI_IN_PLACE : & res1->runtime, & res1->runtime, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
-  res->rate = res->total_files / res->runtime;
-  return res;
+  res1->rate = res1->total_files / res1->runtime;
+  return res1;
 }
 
 static char  find_file_type(unsigned char c) {
@@ -415,7 +421,7 @@ static void find_do_lstat(char *path) {
 
   res->total_files++;
 
-  if (lstat(dir, & buf) == 0) {
+  if (dfs_stat(opt->dfs, NULL, dir, & buf) == 0) {
     check_buf(buf, dir);
   } else {
     res->errors++;
@@ -425,26 +431,32 @@ static void find_do_lstat(char *path) {
 
 static void find_do_readdir(char *path) {
     char dir[PATH_MAX];
+    int rc;
+
     sprintf(dir, "%s%s", start_dir, path);
     path = & dir[start_dir_length];
 
-    DIR *d;
+    dfs_obj_t *d;
     if( open_dir ){
       d = open_dir;
     }else{
-      d = opendir(dir);
-      if (!d) {
+      //rc = dfs_open(opt->dfs, NULL, dir, S_IFDIR, O_RDWR, 0, 0, NULL, &d);
+      rc = dfs_lookup(opt->dfs, dir, O_RDWR, &d, NULL, NULL);
+      //d = opendir(dir);
+      if (rc) {
           if(opt->verbosity > 1){
-            fprintf(runtime.logfile, "Cannot open '%s': %s\n", dir, strerror (errno));
+            fprintf(runtime.logfile, "Cannot open '%s': %s\n", dir, strerror (rc));
           }
           res->errors++;
           return;
       }
     }
-    int fd = dirfd(d);
+    //int fd = dirfd(d);
     int processed = 0;
-    while (1) {
-        //printf("find_do_readdir %s - %s\n", dir, path);
+    uint32_t num_dirents = 1024;
+    struct dirent entry[1024];
+
+    while (!daos_anchor_is_eof(&anchor)) {
         if(processed > opt->max_dirs_per_iter){
           // break criteria to allow contination of job stealing and such
           if(open_dir == NULL){
@@ -453,85 +465,97 @@ static void find_do_readdir(char *path) {
           }
           return;
         }
-        struct dirent *entry;
-        entry = readdir(d);
+
+	rc = dfs_readdir(opt->dfs, d, &anchor, &num_dirents, entry);
+	if (rc) {
+		fprintf(runtime.logfile, "Cannot readdir '%s': %s\n", dir, strerror (rc));
+		res->errors++;
+		return;
+	}
+        //entry = readdir(d);
         if (opt->stonewall_timer && MPI_Wtime() >= runtime.stonewall_endtime ){
           if(opt->verbosity > 1){
             fprintf(runtime.logfile, "Hit stonewall at %.2fs\n", MPI_Wtime());
           }
           break;
         }
-        if (entry == 0) {
-            break;
-        }
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-            continue;
-        }
-        res->checked_dirents++;
-        processed++;
 
-        char typ = find_file_type(entry->d_type);
-        if (typ == 'u'){
-          res->unknown_file++;
-          // sometimes the filetype is not provided by readdir.
-          struct stat buf;
-          if (fstatat(fd, entry->d_name, & buf, 0 )) {
-            res->errors++;
-            if(opt->verbosity > 1){
-              fprintf(runtime.logfile, "Error stating file: %s\n", dir);
-            }
-            continue;
-          }
-          typ = S_ISDIR(buf.st_mode) ? 'd' : 'f';
-
-          if(typ == 'f'){ // since we have done the stat already, it would be a waste to do it again
-            res->total_files++;
-            // compare values
-            if(opt->name_pattern && regexec(& opt->name_regex, entry->d_name, 0, NULL, 0) ){
-              if(opt->verbosity >= 2){
-                printf("Name does not match: %s\n", entry->d_name);
-              }
+	uint32_t i;
+	for (i = 0; i < num_dirents; i++) {
+          if (strcmp(entry[i].d_name, ".") == 0 || strcmp(entry[i].d_name, "..") == 0) {
               continue;
-            }
-            check_buf(buf, entry->d_name);
-            continue;
-          }
-        }else if (typ != 'd'){
-          // compare file name
-          if(opt->name_pattern && regexec(& opt->name_regex, entry->d_name, 0, NULL, 0) ){
-            res->total_files++;
-            if(opt->verbosity >= 2){
-              printf("Name does not match: %s\n", entry->d_name);
-            }
-            continue;
-          }
-          if(! runtime.needs_stat){
-            res->total_files++;
-            // optimization to skip stat
-            res->found_files++;
-            if(! opt->just_count){
-              fprintf(runtime.logfile, "%s/%s\n", dir, entry->d_name);
-            }
-            continue;
-          }
-        }
+	  }
+	  res->checked_dirents++;
+	  processed++;
 
-        if(enqueue_work(typ, path, entry->d_name)){
-          if(open_dir == NULL){
-            strcpy(open_dir_name, path);
-            open_dir = d;
-          }
-          char cur_path[PATH_MAX];
-          sprintf(cur_path, "%s/%s", path, entry->d_name);
+	  entry[i].d_type = 0;
+	  char typ = find_file_type(entry[i].d_type);
 
-          if(typ == 'd'){
-            printf("[%d] WARNING, dropped processing of the directory %s as the queue is full\n", pfind_rank, cur_path);
-          }else{
-            find_do_lstat(cur_path);
-          }
-          return;
-        }
+	  if (typ == 'u'){
+  	    res->unknown_file++;
+	    // sometimes the filetype is not provided by readdir.
+	    struct stat buf;
+	    if (dfs_stat(opt->dfs, d, entry[i].d_name, & buf)) {
+	      res->errors++;
+	      if(opt->verbosity > 1){
+  	        fprintf(runtime.logfile, "Error stating file: %s\n", dir);
+	      }
+	      continue;
+	    }
+
+	    typ = S_ISDIR(buf.st_mode) ? 'd' : 'f';
+
+	    if(typ == 'f'){
+              res->total_files++;
+	      // compare values
+	      if(opt->name_pattern && regexec(& opt->name_regex, entry[i].d_name, 0, NULL, 0) ){
+		      if(opt->verbosity >= 2){
+			      printf("Name does not match: %s\n", entry[i].d_name);
+		      }
+		      continue;
+	      }
+	      check_buf(buf, entry[i].d_name);
+	      continue;
+	    }
+	  }else if (typ != 'd'){
+		  assert(0);
+            // compare file name
+	    if(opt->name_pattern && regexec(& opt->name_regex, entry[i].d_name, 0, NULL, 0) ){
+	      res->total_files++;
+	      if(opt->verbosity >= 2){
+                printf("Name does not match: %s\n", entry[i].d_name);
+	      }
+	      continue;
+	    }
+	    if(! runtime.needs_stat){
+              res->total_files++;
+	      // optimization to skip stat
+	      res->found_files++;
+	      if(! opt->just_count){
+                fprintf(runtime.logfile, "%s/%s\n", dir, entry[i].d_name);
+	      }
+	      continue;
+	    }
+	  }
+
+	  if(enqueue_work(typ, path, entry[i].d_name)){
+            if(open_dir == NULL){
+              strcpy(open_dir_name, path);
+	      open_dir = d;
+	    }
+	    char cur_path[PATH_MAX];
+	    sprintf(cur_path, "%s/%s", path, entry[i].d_name);
+
+	    if(typ == 'd'){
+              printf("[%d] WARNING, dropped processing of the directory %s as the queue is full\n", pfind_rank, cur_path);
+	    }else{
+              find_do_lstat(cur_path);
+	    }
+	    return;
+	  }
+	}
     }
-    closedir(d);
+    dfs_release(d);
+    memset(&anchor, 0, sizeof(daos_anchor_t));
     open_dir = NULL;
 }

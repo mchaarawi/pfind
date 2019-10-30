@@ -3,6 +3,9 @@
 
 #include <stdint.h>
 #include <regex.h>
+#include <gurt/common.h>
+#include <daos.h>
+#include <daos_fs.h>
 
 extern int pfind_rank;
 extern int pfind_size;
@@ -25,6 +28,11 @@ typedef struct {
   int max_dirs_per_iter;
   int steal_from_next; // if true, then steal from the next process
 
+  uuid_t pool_uuid;
+  uuid_t cont_uuid;
+  char *svcl;
+  char *dfs_dir;
+  dfs_t *dfs;
   int verbosity;
 } pfind_options_t;
 

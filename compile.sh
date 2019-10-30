@@ -1,9 +1,12 @@
 #!/bin/bash -e
 # This script builds the optional parallel find
 
+DAOS=/home/mschaara/install/daos
+GURT=/home/mschaara/install/deps_daos/cart
 CC="${CC:-mpicc}"
 CFLAGS="-g -O2 -Wextra -Wall -pipe -std=gnu99 -Wno-format-overflow"
-LDFLAGS=""
+CFLAGS+="-I$DAOS/include -I$GURT/include"
+LDFLAGS="-L$DAOS/lib -L$GURT/lib -lgurt -luuid -ldaos_common -ldaos -ldfs"
 
 rm *.o 2>&1 || true
 

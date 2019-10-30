@@ -63,8 +63,32 @@ pfind_options_t * pfind_parse_args(int argc, char ** argv, int force_print_help)
   // but we need to replace them with -x so that getopt will ignore them
   // and getopt will continue to process beyond them
   for(int i=1; i < argc - 1; i++){
+    int rc;
     if(strcmp(argv[i], "-newer") == 0){
       res->timestamp_file = strdup(argv[i+1]);
+      argv[i] = NONE_STR;
+      argv[++i] = NONE_STR;
+    }else if (strcmp(argv[i], "-dfs_dir") == 0){
+      res->dfs_dir = strdup(argv[i+1]);
+      argv[i] = NONE_STR;
+      argv[++i] = NONE_STR;
+    }else if (strcmp(argv[i], "-pool") == 0) {
+      printf("POOL UUID = %s\n", argv[i+1]);
+      rc = uuid_parse(argv[i+1], res->pool_uuid);
+      if (rc)
+          pfind_abort("Invalid Pool UUID\n");
+      argv[i] = NONE_STR;
+      argv[++i] = NONE_STR;
+    }else if (strcmp(argv[i], "-cont") == 0) {
+      printf("CONT UUID = %s\n", argv[i+1]);
+      rc = uuid_parse(argv[i+1], res->cont_uuid);
+      if (rc)
+          pfind_abort("Invalid Cont UUID\n");
+      argv[i] = NONE_STR;
+      argv[++i] = NONE_STR;
+    }else if (strcmp(argv[i], "-svcl") == 0) {
+      printf("SVCL = %s\n", argv[i+1]);
+      res->svcl = strdup(argv[i+1]);
       argv[i] = NONE_STR;
       argv[++i] = NONE_STR;
     }else if(strcmp(argv[i], "-size") == 0){
@@ -85,15 +109,15 @@ pfind_options_t * pfind_parse_args(int argc, char ** argv, int force_print_help)
       char * str = argv[i+1];
       char * out = res->name_pattern;
       int pos = 0;
-      for(unsigned i=0; i < strlen(str); i++){
-        if(str[i] == '*'){
+      for(unsigned j=0; j < strlen(str); j++){
+        if(str[j] == '*'){
           pos += sprintf(out + pos, ".*");
-        }else if(str[i] == '.'){
+        }else if(str[j] == '.'){
           pos += sprintf(out + pos, "[.]");
-        }else if(str[i] == '"' || str[i] == '\"'){
+        }else if(str[j] == '"' || str[j] == '\"'){
           // erase the "
         }else{
-          out[pos] = str[i];
+          out[pos] = str[j];
           pos++;
         }
       }
@@ -182,11 +206,7 @@ pfind_options_t * pfind_parse_args(int argc, char ** argv, int force_print_help)
     exit(0);
   }
 
-
-  if(! firstarg){
-    pfind_abort("Error: pfind <directory>\n");
-  }
-  res->workdir = firstarg;
+  res->workdir = res->dfs_dir;
 
   return res;
 }
