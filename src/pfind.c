@@ -168,7 +168,7 @@ static void find_process_one_item(){
 
 #define CHECK_MPI if(ret != MPI_SUCCESS){ printf("ERROR in %d\n", __LINE__); exit (1); }
 
-pfind_find_results_t * pfind_find(pfind_options_t * lopt){
+pfind_find_results_t * pfind_find_old(pfind_options_t * lopt){
   opt = lopt;
   memset(& runtime, 0, sizeof(pfind_runtime_options_t));
   int ret;
