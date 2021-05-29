@@ -1,8 +1,8 @@
 #!/bin/bash -e
 # This script builds the optional parallel find
 
-DAOS=/home/mschaara/install/daos
-MFU=/home/mschaara/install/mpifileutils
+DAOS=${MY_DAOS_INSTALL_PATH}
+MFU=${MY_MFU_INSTALL_PATH}
 
 CC="${CC:-mpicc}"
 CFLAGS="-g -O2 -Wextra -Wall -pipe -std=gnu99 -Wno-format-overflow -I$MFU/include/"
