@@ -23,9 +23,7 @@ static void pfind_print_help(pfind_options_t * res){
       "\t-name|-regex = \"%s\"\n"
       "Optional flags\n"
       "\t-N: steal with 50%% likelihood from the next process instead of randomly\n"
-      "\t-M <COUNT>: maximum number of elements to process per readdir iteration = %d\n"
       "\t-C: don't output file names just count the number of files found\n"
-      "\t-H [option]: parallelize single directory access [option 1=hashing, option 2=sequential]\n"
       "\t-P: output per process for debugging and checks loadbalance\n"
       "\t-D [rates]: print rates\n"
       "\t-s <seconds>: Stonewall timer for find = %d\n"
@@ -37,7 +35,6 @@ static void pfind_print_help(pfind_options_t * res){
       res->workdir,
       res->timestamp_file,
       res->name_pattern,
-      res->max_entries_per_iter,
       res->stonewall_timer,
       res->results_dir,
       res->verbosity,
@@ -45,11 +42,7 @@ static void pfind_print_help(pfind_options_t * res){
     );
 }
 
-pfind_options_t * pfind_parse_args(int argc, char ** argv, int force_print_help, MPI_Comm com){
-  MPI_Comm_rank(com, & pfind_rank);
-  MPI_Comm_size(com, & pfind_size);
-  pfind_com = com;
-
+pfind_options_t * pfind_parse_args(int argc, char ** argv, int force_print_help){
   pfind_options_t * res = malloc(sizeof(pfind_options_t));
   memset(res, 0, sizeof(pfind_options_t));
   int print_help = force_print_help;
@@ -61,17 +54,19 @@ pfind_options_t * pfind_parse_args(int argc, char ** argv, int force_print_help,
   res->name_pattern = NULL;
   res->size = UINT64_MAX;
   res->queue_length = 100000;
-  res->max_entries_per_iter = 1000;
+  res->max_dirs_per_iter = 10000;
   char * firstarg = NULL;
 
+  #define NONE_STR "-x"
+
   // when we find special args, we process them
-  // but we need to replace them with 0 so that getopt will ignore them
+  // but we need to replace them with -x so that getopt will ignore them
   // and getopt will continue to process beyond them
   for(int i=1; i < argc - 1; i++){
     if(strcmp(argv[i], "-newer") == 0){
       res->timestamp_file = strdup(argv[i+1]);
-      argv[i][0] = 0;
-      argv[++i][0] = 0;
+      argv[i] = NONE_STR;
+      argv[++i] = NONE_STR;
     }else if(strcmp(argv[i], "-size") == 0){
       char * str = argv[i+1];
       char extension = str[strlen(str)-1];
@@ -82,8 +77,8 @@ pfind_options_t * pfind_parse_args(int argc, char ** argv, int force_print_help,
         default:
           pfind_abort("Unsupported exension for -size\n");
       }
-      argv[i][0] = 0;
-      argv[++i][0] = 0;
+      argv[i] = NONE_STR;
+      argv[++i] = NONE_STR;
     }else if(strcmp(argv[i], "-name") == 0){
       res->name_pattern = malloc(strlen(argv[i+1])*4+100);
       // transform a traditional name pattern to a regex:
@@ -108,19 +103,19 @@ pfind_options_t * pfind_parse_args(int argc, char ** argv, int force_print_help,
       if(ret){
         pfind_abort("Invalid regex for name given\n");
       }
-      argv[i][0] = 0;
-      argv[++i][0] = 0;
+      argv[i] = NONE_STR;
+      argv[++i] = NONE_STR;
     }else if(strcmp(argv[i], "-regex") == 0){
       res->name_pattern = strdup(argv[i+1]);
       int ret = regcomp(& res->name_regex, res->name_pattern, 0);
       if(ret){
         pfind_abort("Invalid regex for name given\n");
       }
-      argv[i][0] = 0;
-      argv[++i][0] = 0;
+      argv[i] = NONE_STR;
+      argv[++i] = NONE_STR;
     }else if(! firstarg){
       firstarg = strdup(argv[i]);
-      argv[i][0] = 0;
+      argv[i] = NONE_STR;
     }
   }
   if(argc == 2){
@@ -128,15 +123,12 @@ pfind_options_t * pfind_parse_args(int argc, char ** argv, int force_print_help,
   }
 
   int c;
-  while ((c = getopt(argc, argv, "CPs:r:vhD:xq:H:NM:")) != -1) {
+  while ((c = getopt(argc, argv, "CPs:r:vhD:xq:NM:")) != -1) {
     if (c == -1) {
         break;
     }
 
     switch (c) {
-    case 'H':
-      res->parallel_single_dir_access = atoi(optarg);
-      break;
     case 'N':
       res->steal_from_next = 1;
       break;
@@ -172,7 +164,7 @@ pfind_options_t * pfind_parse_args(int argc, char ** argv, int force_print_help,
     case 'v':
       res->verbosity++; break;
     case 'M':
-      res->max_entries_per_iter = atol(optarg); break;
+      res->max_dirs_per_iter = atol(optarg); break;
     case 0:
       break;
     }

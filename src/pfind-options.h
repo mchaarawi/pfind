@@ -3,11 +3,9 @@
 
 #include <stdint.h>
 #include <regex.h>
-#include <mpi.h>
 
 extern int pfind_rank;
 extern int pfind_size;
-extern MPI_Comm pfind_com;
 
 typedef struct {
   // https://www.gnu.org/software/findutils/manual/html_mono/find.html
@@ -24,21 +22,12 @@ typedef struct {
   uint64_t size;
   // optimizing parameters
   int queue_length;
-  int max_entries_per_iter;
+  int max_dirs_per_iter;
   int steal_from_next; // if true, then steal from the next process
-  int parallel_single_dir_access; // if 1, use hashing to parallelize single directory access, if 2 sequential increment
 
   int verbosity;
 } pfind_options_t;
 
-typedef struct {
-  uint64_t job_steal_inbound;
-  uint64_t work_send;
-  uint64_t job_steal_tries;
-  uint64_t work_stolen;
-  uint64_t job_steal_mpitime_us; // microseconds spend in job steal attempts (MPI)
-  uint64_t completion_tokens_send;
-} pfind_monitoring_t;
 
 typedef struct{
   uint64_t errors;
@@ -51,14 +40,11 @@ typedef struct{
 
   double rate;
   double runtime;
-
-  pfind_monitoring_t monitor;
-  MPI_Comm com;
 } pfind_find_results_t;
 
 pfind_find_results_t * pfind_find(pfind_options_t * opt);
 pfind_find_results_t * pfind_aggregrate_results(pfind_find_results_t * local);
-pfind_options_t * pfind_parse_args(int argc, char ** argv, int force_print_help, MPI_Comm com);
+pfind_options_t * pfind_parse_args(int argc, char ** argv, int force_print_help);
 void pfind_abort(char * str);
 
 #ifndef UINT64_MAX
