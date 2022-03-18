@@ -210,7 +210,6 @@ static void find_process_one_item2() {
 		idx = -1;
 	}
 
-	printf("%d: do readdir %s %d\n", pfind_rank, tmp_path, idx);
 	find_do_readdir2(tmp_path, idx);
 }
 
@@ -221,7 +220,7 @@ pfind_find_results_t * pfind_find(pfind_options_t * lopt){
   memset(& runtime, 0, sizeof(pfind_runtime_options_t));
   int ret;
 
-  pfind_init_daos();
+  pfind_init_daos(pfind_com);
 
   if(opt->timestamp_file){
     if(pfind_rank==0) {
@@ -366,15 +365,14 @@ pfind_find_results_t * pfind_find(pfind_options_t * lopt){
         debug("[%d] msg ready from %d !\n", pfind_rank, requesting_rank);
 
         int work_to_give = pending_work / 2;
-	//int work_to_give = pending_work / pfind_size;
+	if (work_to_give)
+		work_to_give = 1;
 
         res->monitor.job_steal_inbound++;
         res->monitor.work_send += work_to_give;
 
         int datasize = sizeof(work_t)*work_to_give;
         pending_work -= work_to_give;
-	if (work_to_give)
-		printf("sending work to %d (%d)\n", requesting_rank, work_to_give);
         #ifndef LZ4
           ret = MPI_Send(& work[pending_work], datasize, MPI_CHAR, requesting_rank, MSG_JOB_STEAL_RESPONSE, pfind_com);
 
@@ -490,7 +488,7 @@ pfind_find_results_t * pfind_find(pfind_options_t * lopt){
   res->rate = res->total_files / res->runtime;
   res->com = pfind_com;
 
-  pfind_fini_daos();
+  pfind_fini_daos(pfind_com);
   return res;
 }
 

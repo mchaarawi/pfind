@@ -108,7 +108,7 @@ static d_hash_table_ops_t hdl_hash_ops = {
 
 /* Distribute process 0's pool or container handle to others. */
 static void
-HandleDistribute(enum handleType type)
+HandleDistribute(MPI_Comm comm, enum handleType type)
 {
         d_iov_t global;
         int        rc;
@@ -129,12 +129,12 @@ HandleDistribute(enum handleType type)
                 DCHECK(rc, "Failed to get global handle size");
         }
 
-        MPI_Bcast(&global.iov_buf_len, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
+        MPI_Bcast(&global.iov_buf_len, 1, MPI_UINT64_T, 0, comm);
 
 	global.iov_len = global.iov_buf_len;
         global.iov_buf = malloc(global.iov_buf_len);
         if (global.iov_buf == NULL)
-		MPI_Abort(MPI_COMM_WORLD, -1);
+		MPI_Abort(comm, -1);
 
         if (pfind_rank == 0) {
                 if (type == POOL_HANDLE)
@@ -146,7 +146,7 @@ HandleDistribute(enum handleType type)
                 DCHECK(rc, "Failed to create global handle");
         }
 
-        MPI_Bcast(global.iov_buf, global.iov_buf_len, MPI_BYTE, 0, MPI_COMM_WORLD);
+        MPI_Bcast(global.iov_buf, global.iov_buf_len, MPI_BYTE, 0, comm);
 
         if (pfind_rank != 0) {
                 if (type == POOL_HANDLE)
@@ -310,19 +310,19 @@ lookup_insert_dir(const char *name, mode_t *mode)
 }
 
 void
-pfind_init_daos() {
+pfind_init_daos(MPI_Comm comm) {
 	int rc;
 
 	char *pool_str = getenv("DAOS_POOL");
 	if (pool_str == NULL) {
 		printf("DAOS_POOL env variable is not set\n");
-		MPI_Abort(MPI_COMM_WORLD, -1);
+		MPI_Abort(comm, -1);
 	}
 
 	char *cont_str = getenv("DAOS_CONT");
 	if (cont_str == NULL) {
 		printf("DAOS_CONT env variable is not set\n");
-		MPI_Abort(MPI_COMM_WORLD, -1);
+		MPI_Abort(comm, -1);
 	}
 
 	rc = daos_init();
@@ -342,9 +342,9 @@ pfind_init_daos() {
 		DCHECK(rc, "Failed to mount DFS namespace");
 	}
 
-	HandleDistribute(POOL_HANDLE);
-	HandleDistribute(CONT_HANDLE);
-	HandleDistribute(DFS_HANDLE);
+	HandleDistribute(comm, POOL_HANDLE);
+	HandleDistribute(comm, CONT_HANDLE);
+	HandleDistribute(comm, DFS_HANDLE);
 
         rc = d_hash_table_create(D_HASH_FT_EPHEMERAL | D_HASH_FT_NOLOCK | D_HASH_FT_LRU,
                                  4, NULL, &hdl_hash_ops, &dir_hash);
@@ -352,7 +352,7 @@ pfind_init_daos() {
 }
 
 void
-pfind_fini_daos() {
+pfind_fini_daos(MPI_Comm comm) {
 	int rc;
 
         while (1) {
@@ -369,15 +369,15 @@ pfind_fini_daos() {
 
 	rc = dfs_umount(pfind_dfs);
 	DCHECK(rc, "Failed to umount DFS namespace");
-	MPI_Barrier(MPI_COMM_WORLD);
+	MPI_Barrier(comm);
 
 	rc = daos_cont_close(coh, NULL);
 	DCHECK(rc, "Failed to close container (%d)", rc);
-	MPI_Barrier(MPI_COMM_WORLD);
+	MPI_Barrier(comm);
 
 	rc = daos_pool_disconnect(poh, NULL);
 	DCHECK(rc, "Failed to disconnect from pool");
-	MPI_Barrier(MPI_COMM_WORLD);
+	MPI_Barrier(comm);
 
 	rc = daos_fini();
 	DCHECK(rc, "Failed to finalize DAOS");
