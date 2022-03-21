@@ -295,7 +295,7 @@ lookup_insert_dir(const char *name, mode_t *mode)
         if (hdl == NULL)
                 return NULL;
 
-        strncpy(hdl->name, name, len);
+        strcpy(hdl->name, name);
         hdl->oh = oh;
 
         rc = d_hash_rec_insert(dir_hash, hdl->name, len, &hdl->entry, false);

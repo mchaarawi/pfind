@@ -56,10 +56,8 @@ typedef struct{
 } pfind_runtime_options_t;
 
 static pfind_runtime_options_t runtime;
-static int find_do_readdir(char *path, uint64_t dir_start, uint64_t dir_end);
+static int find_do_readdir(char *path, int idx);
 static void find_do_lstat(char *path);
-static int find_do_readdir2(char *path, int idx);
-static void find_do_lstat2(char *path);
 
 typedef struct {
   char name[PATH_MAX];
@@ -135,22 +133,7 @@ static void enqueue_dir_excess(char * path, __attribute__((unused)) char * entry
   excess_dirs.size++;
 }
 
-static int enqueue_work(char typ, char * path, char * entry){
-  int ret = pending_work >= opt->queue_length;
-  if (ret){
-    return 1;
-  }
-
-  work[pending_work].type = typ;
-  work[pending_work].dir_end = 0;
-  work[pending_work].dir_start = 0;
-  sprintf(work[pending_work].name, "%s/%s", path, entry);
-  //printf("Queuing: %s\n", work[pending_work].name);
-  pending_work++;
-  return 0;
-}
-
-static int enqueue_work2(char typ, char * path){
+static int enqueue_work(char typ, char * path){
   int ret = pending_work >= opt->queue_length;
   if (ret){
     return 1;
@@ -163,33 +146,11 @@ static int enqueue_work2(char typ, char * path){
   return 0;
 }
 
-static void find_process_one_item(){
-  if(current_dir.dir){
-    find_do_readdir(current_dir.name, current_dir.pos_cur, current_dir.pos_end);
-    return;
-  }
-
-  // opt->queue_length
-  if(excess_dirs.size > 0){
-    excess_dirs.size--;
-    find_do_readdir(excess_dirs.dirs[excess_dirs.size].name, 0, 0);
-    return;
-  }
-  pending_work--;
-
-  work_t * cur = & work[pending_work];
-  if( cur->type == 'd'){
-    find_do_readdir(cur->name, cur->dir_start, cur->dir_end);
-  }else{
-    find_do_lstat(cur->name);
-  }
-}
-
 static void find_process_one_item2() {
 	// opt->queue_length
 	if(excess_dirs.size > 0){
 		excess_dirs.size--;
-		find_do_readdir2(excess_dirs.dirs[excess_dirs.size].name, -1);
+		find_do_readdir(excess_dirs.dirs[excess_dirs.size].name, -1);
 		return;
 	}
 	pending_work--;
@@ -199,7 +160,7 @@ static void find_process_one_item2() {
 	char tmp_path[PATH_MAX];
 
 	if( cur->type != 'd') {
-		find_do_lstat2(cur->name);
+		find_do_lstat(cur->name);
 		return;
 	}
 
@@ -210,7 +171,7 @@ static void find_process_one_item2() {
 		idx = -1;
 	}
 
-	find_do_readdir2(tmp_path, idx);
+	find_do_readdir(tmp_path, idx);
 }
 
 #define CHECK_MPI if(ret != MPI_SUCCESS){ printf("ERROR in %d\n", __LINE__); exit (1); }
@@ -373,6 +334,7 @@ pfind_find_results_t * pfind_find(pfind_options_t * lopt){
 
         int datasize = sizeof(work_t)*work_to_give;
         pending_work -= work_to_give;
+
         #ifndef LZ4
           ret = MPI_Send(& work[pending_work], datasize, MPI_CHAR, requesting_rank, MSG_JOB_STEAL_RESPONSE, pfind_com);
 
@@ -553,175 +515,6 @@ static void check_buf(struct stat buf, char * path){
 }
 
 static void find_do_lstat(char *path) {
-  char dir[PATH_MAX];
-  sprintf(dir, "%s/%s", start_dir, path);
-  struct stat buf;
-  // filename comparison has been done already
-  if(opt->verbosity >= 2){
-    printf("STAT: %s\n", dir);
-  }
-
-  res->total_files++;
-
-  if (stat(dir, & buf) == 0) {
-    check_buf(buf, dir);
-  } else {
-    res->errors++;
-    fprintf(runtime.logfile, "Error stating file: %s\n", dir);
-  }
-}
-
-static int find_do_readdir(char *path, uint64_t dir_start, uint64_t dir_end) {
-    char dir[PATH_MAX];
-    sprintf(dir, "%s%s", start_dir, path);
-    path = & dir[start_dir_length];
-
-    DIR *d;
-    if( current_dir.dir ){
-      d = current_dir.dir;
-    }else{
-      d = opendir(dir);
-      if (!d) {
-          if(opt->verbosity > 1){
-            fprintf(runtime.logfile, "Cannot open '%s': %s\n", dir, strerror (errno));
-          }
-          res->errors++;
-          return 0;
-      }
-      if(opt->parallel_single_dir_access){
-        if(dir_start == 0 && dir_end == 0){
-          dir_end = LONG_MAX;
-        }
-        if(dir_start != 0){
-          seekdir(d, dir_start);
-        }
-      }
-    }
-    int fd = dirfd(d);
-    int processed = 0;
-
-    while (1) {
-        uint64_t pos = 0;
-        if(opt->parallel_single_dir_access){
-          pos = telldir(d);
-          debug("[%d] processing %llu\n", pfind_rank, (long long unsigned) pos);
-
-          if(pos < dir_start){
-            fprintf(runtime.logfile, "Error, telldir() returned smaller value, hashing doesn't work\n");
-            exit(1);
-          }
-          if(pos >= dir_end){
-            debug("[%d] reached end %llu >= %llu\n", pfind_rank, (long long unsigned) pos, (long long unsigned) dir_end);
-            // done processing with hashing
-            closedir(d);
-            current_dir.dir = NULL;
-            return 0;
-          }
-        }
-        //printf("find_do_readdir %s - %s\n", dir, path);
-        if(processed > opt->max_entries_per_iter){
-          debug("[%d] interrupting readdir\n", pfind_rank);
-          // break criteria to allow continuation of job stealing and such
-          if(current_dir.dir == NULL){
-            strcpy(current_dir.name, path);
-            current_dir.dir = d;
-          }
-          current_dir.pos_cur = pos;
-          current_dir.pos_end = dir_end;
-          return 1;
-        }
-        struct dirent *entry;
-        entry = readdir(d);
-        if (opt->stonewall_timer && MPI_Wtime() >= runtime.stonewall_endtime ){
-          if(opt->verbosity > 1){
-            fprintf(runtime.logfile, "Hit stonewall at %.2fs\n", MPI_Wtime());
-          }
-          break;
-        }
-        if (entry == NULL) {
-            break;
-        }
-        //debug("[%d] %s\n", pfind_rank, entry->d_name);
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-            continue;
-        }
-        res->checked_dirents++;
-        processed++;
-
-        char typ = find_file_type(entry->d_type);
-        if (typ == 'u'){
-          res->unknown_file++;
-          // sometimes the filetype is not provided by readdir.
-          struct stat buf;
-          if (fstatat(fd, entry->d_name, & buf, 0 )) {
-            res->errors++;
-            if(opt->verbosity > 1){
-              fprintf(runtime.logfile, "Error stating file: %s\n", dir);
-            }
-            continue;
-          }
-          typ = S_ISDIR(buf.st_mode) ? 'd' : 'f';
-
-          if(typ == 'f'){ // since we have done the stat already, it would be a waste to do it again
-            res->total_files++;
-            // compare values
-            if(opt->name_pattern && regexec(& opt->name_regex, entry->d_name, 0, NULL, 0) ){
-              if(opt->verbosity >= 2){
-                printf("Name does not match: %s\n", entry->d_name);
-              }
-              continue;
-            }
-            check_buf(buf, entry->d_name);
-            continue;
-          }
-        }else if (typ != 'd'){
-          // compare file name
-          if(opt->name_pattern && regexec(& opt->name_regex, entry->d_name, 0, NULL, 0) ){
-            res->total_files++;
-            if(opt->verbosity >= 2){
-              printf("Name does not match: %s\n", entry->d_name);
-            }
-            continue;
-          }
-          if(! runtime.needs_stat){
-            res->total_files++;
-            // optimization to skip stat
-            res->found_files++;
-            if(! opt->just_count){
-              fprintf(runtime.logfile, "%s/%s\n", dir, entry->d_name);
-            }
-            continue;
-          }
-        }
-
-        // we need to perform a stat operation
-        if(enqueue_work(typ, path, entry->d_name)){
-          if(current_dir.dir == NULL){
-            strcpy(current_dir.name, path);
-            current_dir.dir = d;
-          }
-
-          if(typ == 'd'){
-            static int printed_warning = 0;
-            if(! printed_warning){
-              printf("[%d] WARNING, utilizing excess queue for processing of the directory %s as the queue is full, supressing further messages. This may lead to suboptimal performance. Try to increase the queue size.\n", pfind_rank, entry->d_name);
-              printed_warning = 1;
-            }
-            enqueue_dir_excess(path, entry->d_name);
-          }else{
-            char cur_path[PATH_MAX];
-            sprintf(cur_path, "%s/%s", path, entry->d_name);
-            find_do_lstat(cur_path);
-          }
-          return 1;
-        }
-    }
-    closedir(d);
-    current_dir.dir = NULL;
-    return 0;
-}
-
-static void find_do_lstat2(char *path) {
 	struct stat buf;
 
 	// filename comparison has been done already
@@ -739,7 +532,7 @@ static void find_do_lstat2(char *path) {
 	}
 }
 
-static int find_do_readdir2(char *path, int idx) {
+static int find_do_readdir(char *path, int idx) {
 	DIR *d;
 
 	if (idx == -1) {
@@ -750,7 +543,7 @@ static int find_do_readdir2(char *path, int idx) {
 		for (i=0 ; i<nr; i++) {
 			sprintf(tmp, "~~%d:%s", i, path);
 			//printf("enqueue %s\n", tmp);
-			enqueue_work2('d', tmp);
+			enqueue_work('d', tmp);
 		}
 		pfind_dfs_closedir(d);
 		return 0;
@@ -844,7 +637,7 @@ static int find_do_readdir2(char *path, int idx) {
 		}
 
 		// we need to perform a stat operation
-		if (enqueue_work2(typ, newpath)) {
+		if (enqueue_work(typ, newpath)) {
 			if(typ == 'd') {
 				static int printed_warning = 0;
 				if(! printed_warning){
@@ -853,9 +646,7 @@ static int find_do_readdir2(char *path, int idx) {
 				}
 				enqueue_dir_excess(newpath, entry->d_name);
 			} else {
-				//char cur_path[PATH_MAX];
-				//sprintf(cur_path, "%s/%s", path, entry->d_name);
-				find_do_lstat2(newpath);
+				find_do_lstat(newpath);
 			}
 			return 1;
 		}
