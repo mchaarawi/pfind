@@ -23,6 +23,7 @@
 #define PATH_MAX 4096
 #warning "Could not detect PATH_MAX"
 #endif
+#define PFIND_PATH_MAX 128
 
 #define MSG_COMPLETE 777
 #define MSG_JOB_STEAL 800
@@ -41,7 +42,7 @@ MPI_Comm pfind_com;
 // parallel recursive find
 
 // globals
-static char start_dir[PATH_MAX]; // absolute path of start directory
+static char start_dir[PFIND_PATH_MAX]; // absolute path of start directory
 static int start_dir_length;
 static int msg_type_flag = 0;
 
@@ -60,15 +61,12 @@ static int find_do_readdir(char *path, int idx);
 static void find_do_lstat(char *path);
 
 typedef struct {
-  char name[PATH_MAX];
-  uint64_t dir_start; // start position to read a directory
-  uint64_t dir_end;   // end position to read a directory
-  int idx;
+  char name[PFIND_PATH_MAX];
   char type; // 'd' for directory
 } work_t;
 
 typedef struct { // a directory work item, that is fetched in excess of processing capabilities
-  char name[PATH_MAX];
+  char name[PFIND_PATH_MAX];
 } work_dir_t;
 
 typedef struct{
@@ -79,13 +77,8 @@ typedef struct{
 
 typedef struct{
   DIR * dir;
-  char name[PATH_MAX];
-  uint64_t pos_cur;
-  uint64_t pos_end;
-  int idx;
+  char name[PFIND_PATH_MAX];
 } currently_processed_dir_t;
-
-static currently_processed_dir_t current_dir = {NULL};
 
 // queue of work
 static work_t * work;
@@ -157,7 +150,7 @@ static void find_process_one_item2() {
 
 	work_t * cur = & work[pending_work];
 	int idx;
-	char tmp_path[PATH_MAX];
+	char tmp_path[PFIND_PATH_MAX];
 
 	if( cur->type != 'd') {
 		find_do_lstat(cur->name);
@@ -261,7 +254,7 @@ pfind_find_results_t * pfind_find(pfind_options_t * lopt){
 
   while(! msg_type_flag){
     //usleep(100000);
-    int have_completed = (pending_work == 0 && excess_dirs.size == 0 && current_dir.dir == NULL);
+    int have_completed = (pending_work == 0 && excess_dirs.size == 0);
     debug("[%d] processing: %d [%d, %d, phase: %d]\n", pfind_rank, pending_work, have_finalize_token, have_processed_work_after_token, phase);
     // do we have more work?
     if(! have_completed){
@@ -358,7 +351,6 @@ pfind_find_results_t * pfind_find(pfind_options_t * lopt){
           //printf("Move %d ex_pos: %d Move: %d\n", pending_work, ex_pos, to_move);
           for(int i = 0 ; i < to_move; i++, pending_work++, ex_pos--){
             work[pending_work].type = 'd';
-            work[pending_work].dir_start = 0;
             strcpy(work[pending_work].name, excess_dirs.dirs[ex_pos].name);
           }
           excess_dirs.size -= to_move;
@@ -537,7 +529,7 @@ static int find_do_readdir(char *path, int idx) {
 
 	if (idx == -1) {
 		int nr = -1, i;
-		char tmp[PATH_MAX];
+		char tmp[PFIND_PATH_MAX];
 		
 		d = pfind_dfs_opendir(path, &nr);
 		for (i=0 ; i<nr; i++) {
@@ -576,7 +568,7 @@ static int find_do_readdir(char *path, int idx) {
 			break;
 		}
 
-		char newpath[PATH_MAX];
+		char newpath[PFIND_PATH_MAX];
 
 		strcpy(newpath, path);
 		strcat(newpath, "/");
@@ -652,7 +644,5 @@ static int find_do_readdir(char *path, int idx) {
 		}
 	}
 	pfind_dfs_closedir(d);
-	current_dir.dir = NULL;
-	current_dir.idx = -1;
 	return 0;
 }
