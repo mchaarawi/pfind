@@ -139,7 +139,7 @@ static int enqueue_work(char typ, char * path){
   return 0;
 }
 
-static void find_process_one_item2() {
+static void find_process_one_item() {
 	// opt->queue_length
 	if(excess_dirs.size > 0){
 		excess_dirs.size--;
@@ -200,6 +200,8 @@ pfind_find_results_t * pfind_find(pfind_options_t * lopt){
   }else{
     runtime.logfile = stdout;
   }
+
+  pfind_dfs_set_filter(runtime.ctime_min, opt->name_pattern);
 
   // allocate sufficient large buffer size, we may receive up to size unexpected "stealing" calls
   int bsend_size = (pfind_size + 1) * MPI_BSEND_OVERHEAD;
@@ -264,7 +266,7 @@ pfind_find_results_t * pfind_find(pfind_options_t * lopt){
         }
         pending_work = 0;
       }else{
-        find_process_one_item2();
+        find_process_one_item();
       }
     }
 
@@ -500,9 +502,9 @@ static void check_buf(struct stat buf, char * path){
         return;
       }
     }
-    //if(! opt->just_count){
-    //fprintf(runtime.logfile, "%s\n", path);
-    //}
+    if(! opt->just_count){
+	    fprintf(runtime.logfile, "%s\n", path);
+    }
     res->found_files++;
 }
 
@@ -513,8 +515,6 @@ static void find_do_lstat(char *path) {
 	if(opt->verbosity >= 2){
 		printf("STAT: %s\n", path);
 	}
-
-	res->total_files++;
 
 	if (pfind_dfs_lstat(path, &buf) == 0) {
 		check_buf(buf, path);
@@ -550,13 +550,16 @@ static int find_do_readdir(char *path, int idx) {
 		return 0;
 	}
 
-	int processed = 0;
-
 	while (1) {
 		//printf("find_do_readdir %s\n", path);
 
 		struct dirent *entry;
-		entry = pfind_dfs_readdir(d);
+		uint64_t nr_scanned;
+
+		entry = pfind_dfs_readdir(d, &nr_scanned);
+		res->checked_dirents += nr_scanned;
+		res->total_files += nr_scanned;
+
 		if (opt->stonewall_timer && MPI_Wtime() >= runtime.stonewall_endtime ){
 			if(opt->verbosity > 1){
 				fprintf(runtime.logfile, "Hit stonewall at %.2fs\n", MPI_Wtime());
@@ -578,47 +581,13 @@ static int find_do_readdir(char *path, int idx) {
 		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
 			continue;
 		}
-		res->checked_dirents++;
-		processed++;
 
 		char typ = find_file_type(entry->d_type);
-		if (typ == 'u'){
-			res->unknown_file++;
-			// sometimes the filetype is not provided by readdir.
-			struct stat buf;
-			if (pfind_dfs_lstat(newpath, &buf)) {
-				res->errors++;
-				if(opt->verbosity > 1){
-					fprintf(runtime.logfile, "Error stating file: %s\n", newpath);
-				}
-				continue;
-			}
-			typ = S_ISDIR(buf.st_mode) ? 'd' : 'f';
 
-			if(typ == 'f') { // since we have done the stat already, it would be a waste to do it again
-				res->total_files++;
-				// compare values
-				if(opt->name_pattern && regexec(& opt->name_regex, entry->d_name, 0, NULL, 0) ){
-					if(opt->verbosity >= 2) {
-						printf("Name does not match: %s\n", entry->d_name);
-					}
-					continue;
-				}
-				check_buf(buf, entry->d_name);
-				continue;
-			}
-		} else if (typ != 'd') {
-			assert(0);
-			// compare file name
-			if(opt->name_pattern && regexec(& opt->name_regex, entry->d_name, 0, NULL, 0) ){
-				res->total_files++;
-				if(opt->verbosity >= 2){
-					printf("Name does not match: %s\n", entry->d_name);
-				}
-				continue;
-			}
+		if (typ == 'd')
+			res->total_files --;		
+		if (typ != 'd') {
 			if(! runtime.needs_stat){
-				res->total_files++;
 				// optimization to skip stat
 				res->found_files++;
 				if(! opt->just_count){

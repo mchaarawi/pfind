@@ -92,7 +92,7 @@ pfind_options_t * pfind_parse_args(int argc, char ** argv, int force_print_help,
       int pos = 0;
       for(unsigned i=0; i < strlen(str); i++){
         if(str[i] == '*'){
-          pos += sprintf(out + pos, ".*");
+          pos += sprintf(out + pos, "%%");
         }else if(str[i] == '.'){
           pos += sprintf(out + pos, "[.]");
         }else if(str[i] == '"' || str[i] == '\"'){

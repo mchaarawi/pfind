@@ -43,6 +43,7 @@ enum handleType {
 static daos_handle_t poh;
 static daos_handle_t coh;
 static dfs_t *pfind_dfs;
+static dfs_pipeline_t *dpipe;
 static struct d_hash_table *dir_hash;
 extern int pfind_rank;
 
@@ -438,31 +439,37 @@ int pfind_dfs_closedir(DIR* _dirp)
     return rc;
 }
 
-struct dirent* pfind_dfs_readdir(DIR* _dirp)
+struct dirent* pfind_dfs_readdir(DIR* _dirp, uint64_t *_nr_scanned)
 {
     int rc;
+    uint64_t nr_scanned = 0, tot_scanned = 0;
     struct dfs_pfind_t *dirp = (struct dfs_pfind_t *)_dirp;
 
-    if (dirp->num_ents)
+    if (dirp->num_ents != 0)
 	    goto ret;
 
     dirp->num_ents = NUM_DIRENTS;
 
     while (!daos_anchor_is_eof(&dirp->anchor)) {
-	    rc = dfs_readdir(pfind_dfs, dirp->dir, &dirp->anchor, &dirp->num_ents,
-			     dirp->ents);
-	    if (rc)
+	    rc = dfs_readdir_with_filter(pfind_dfs, dirp->dir, dpipe, &dirp->anchor,
+					 &dirp->num_ents, dirp->ents, &nr_scanned);
+	    if (rc) {
+		    fprintf(stderr, "dfs_readdir_with_filter failed %d\n", rc);
 		    return NULL;
+	    }
 
+	    tot_scanned += nr_scanned;
 	    if (dirp->num_ents == 0)
 		    continue;
 	    goto ret;
     }
 
     assert(daos_anchor_is_eof(&dirp->anchor));
+    *_nr_scanned = tot_scanned;
     return NULL;
 
 ret:
+    *_nr_scanned = tot_scanned;
     dirp->num_ents--;
     return &dirp->ents[dirp->num_ents];
 }
@@ -490,4 +497,28 @@ int pfind_dfs_lstat(const char* path, struct stat* buf)
     }
 
     return 0;
+}
+
+int pfind_dfs_set_filter(time_t ctime_min, const char *name)
+{
+	dfs_predicate_t pred;
+	uint64_t flags = 0;
+	int rc;
+
+	memset(&pred, 0, sizeof(dfs_predicate_t));
+
+	if (ctime_min) {
+		flags = flags | DFS_FILTER_NEWER;;
+		pred.dp_newer = ctime_min;
+	}
+
+	if (name) {
+		flags = flags | DFS_FILTER_NAME;
+		strcpy(pred.dp_name, name);;
+	}
+
+	rc = dfs_pipeline_create(pfind_dfs, pred, flags, &dpipe);
+	if (rc)
+		fprintf(stderr, "dfs_pipeline_create failed (%d)\n", rc); 
+	return rc;
 }
