@@ -45,9 +45,16 @@ MPI_Comm pfind_com;
 static char start_dir[PFIND_PATH_MAX]; // absolute path of start directory
 static int start_dir_length;
 static int msg_type_flag = 0;
+static int nr_reqs = 0;
+
+#ifdef LZ4
+int max_compressed;
+char * compress_buf;
+#endif
 
 static pfind_options_t * opt;
 static pfind_find_results_t * res = NULL;
+static int printed_warning = 0;
 
 typedef struct{
   uint64_t    ctime_min;
@@ -74,11 +81,6 @@ typedef struct{
   int capacity;
   int size;
 } work_excess_dir_t;
-
-typedef struct{
-  DIR * dir;
-  char name[PFIND_PATH_MAX];
-} currently_processed_dir_t;
 
 // queue of work
 static work_t * work;
@@ -140,17 +142,25 @@ static int enqueue_work(char typ, char * path){
 }
 
 static void find_process_one_item() {
+	int idx;
+	char tmp_path[PFIND_PATH_MAX];
+	
 	// opt->queue_length
 	if(excess_dirs.size > 0){
 		excess_dirs.size--;
-		find_do_readdir(excess_dirs.dirs[excess_dirs.size].name, -1);
+
+		if (strncmp(excess_dirs.dirs[excess_dirs.size].name, "~~", 2) == 0) { 
+			sscanf(excess_dirs.dirs[excess_dirs.size].name, "~~%d:%s", &idx, tmp_path);
+		} else {
+			strcpy(tmp_path, excess_dirs.dirs[excess_dirs.size].name);
+			idx = -1;
+		}
+		find_do_readdir(tmp_path, idx);
 		return;
 	}
 	pending_work--;
 
 	work_t * cur = & work[pending_work];
-	int idx;
-	char tmp_path[PFIND_PATH_MAX];
 
 	if( cur->type != 'd') {
 		find_do_lstat(cur->name);
@@ -221,8 +231,8 @@ pfind_find_results_t * pfind_find(pfind_options_t * lopt){
   memset(res, 0, sizeof(*res));
 
   #ifdef LZ4
-    int max_compressed = LZ4_COMPRESSBOUND(opt->queue_length * sizeof(work_t) / 2);
-    char * compress_buf = smalloc(max_compressed);
+    max_compressed = LZ4_COMPRESSBOUND(opt->queue_length * sizeof(work_t) / 2);
+    compress_buf = smalloc(max_compressed);
   #endif
 
   if(opt->stonewall_timer != 0){
@@ -369,6 +379,12 @@ pfind_find_results_t * pfind_find(pfind_options_t * lopt){
       }else{
         steal_neighbor = rand() % pfind_size;
       }
+#if 0
+      if (pfind_rank != 0 && nr_reqs < 5) {
+	      steal_neighbor = 0;
+	      nr_reqs ++;
+      }
+#endif
       if(steal_neighbor != pfind_rank){
         struct timeval t_start;
         pfind_timer_start(& t_start);
@@ -462,6 +478,144 @@ pfind_find_results_t * pfind_aggregrate_results(pfind_find_results_t * local){
   return res;
 }
 
+static int check_steal_req()
+{
+	int has_msg, ret;
+	MPI_Status wait_status;
+
+	has_msg = 1;
+	while(has_msg){
+		ret = MPI_Iprobe(MPI_ANY_SOURCE, MSG_JOB_STEAL, pfind_com, & has_msg, & wait_status);
+		CHECK_MPI
+		if(has_msg){
+			int requesting_rank = wait_status.MPI_SOURCE;
+			ret = MPI_Recv(NULL, 0, MPI_INT, requesting_rank, MSG_JOB_STEAL, pfind_com, & wait_status);
+			CHECK_MPI
+			debug("[%d] msg ready from %d !\n", pfind_rank, requesting_rank);
+
+			int work_to_give = pending_work / 2;
+			if (work_to_give)
+				work_to_give = 1;
+			
+			res->monitor.job_steal_inbound++;
+			res->monitor.work_send += work_to_give;
+
+			int datasize = sizeof(work_t)*work_to_give;
+			pending_work -= work_to_give;
+
+#ifndef LZ4
+			ret = MPI_Send(& work[pending_work], datasize, MPI_CHAR, requesting_rank,
+				       MSG_JOB_STEAL_RESPONSE, pfind_com);
+#else
+
+			if(datasize > 0){
+				int compressed_size;
+				compressed_size = LZ4_compress_default((char*) & work[pending_work],
+								       compress_buf, datasize, max_compressed);
+				ret = MPI_Send(compress_buf, compressed_size, MPI_CHAR, requesting_rank,
+					       MSG_JOB_STEAL_RESPONSE, pfind_com);
+			} else{
+				ret = MPI_Send(NULL, 0, MPI_CHAR, requesting_rank,
+					       MSG_JOB_STEAL_RESPONSE, pfind_com);
+			}
+#endif
+			CHECK_MPI
+
+			// move excess directory queue into the regular queue
+			if(excess_dirs.size > 0){
+				int to_move = work_to_give < excess_dirs.size ? work_to_give : excess_dirs.size;
+				int ex_pos = excess_dirs.size - 1;
+				//printf("Move %d ex_pos: %d Move: %d\n", pending_work, ex_pos, to_move);
+				for(int i = 0 ; i < to_move; i++, pending_work++, ex_pos--){
+					work[pending_work].type = 'd';
+					strcpy(work[pending_work].name, excess_dirs.dirs[ex_pos].name);
+				}
+				excess_dirs.size -= to_move;
+			}
+		}
+	}
+	return 0;
+}
+
+int steal()
+{
+	int work_received = 0;
+	int steal_neighbor = pfind_rank;
+	int has_msg, ret;
+	MPI_Status wait_status;
+
+	// send request for job stealing
+	if(opt->steal_from_next) {
+		steal_neighbor = ((rand() % 2) && (pfind_rank > 0)) ? pfind_rank - 1 : rand() % pfind_size;
+	} else {
+		steal_neighbor = rand() % pfind_size;
+	}
+	if (pfind_rank != 0 && nr_reqs < 5) {
+		steal_neighbor = 0;
+		nr_reqs ++;
+	}
+	if(steal_neighbor != pfind_rank){
+		struct timeval t_start;
+		pfind_timer_start(& t_start);
+		res->monitor.job_steal_tries++;
+
+		debug("[%d] msg attempting to steal from %d\n", pfind_rank, steal_neighbor);
+		ret = MPI_Bsend(NULL, 0, MPI_INT, steal_neighbor, MSG_JOB_STEAL, pfind_com);
+		CHECK_MPI
+		// check for any pending work stealing request, too.
+		while(1){
+			ret = MPI_Iprobe(steal_neighbor, MSG_JOB_STEAL_RESPONSE, pfind_com,
+					 & has_msg, & wait_status);
+			CHECK_MPI
+			if(has_msg){
+				MPI_Get_count(& wait_status, MPI_CHAR, & work_received);
+
+#ifndef LZ4
+				ret = MPI_Recv(work, work_received, MPI_CHAR, steal_neighbor,
+					       MSG_JOB_STEAL_RESPONSE, pfind_com, MPI_STATUS_IGNORE);
+#else
+				if(work_received > 0){
+					ret = MPI_Recv(compress_buf, work_received, MPI_CHAR,
+						       steal_neighbor, MSG_JOB_STEAL_RESPONSE,
+						       pfind_com, MPI_STATUS_IGNORE);
+					int decompressed_size = LZ4_decompress_safe
+						(compress_buf, (char*)work, work_received, max_compressed);
+					//printf("Before: %d after: %d\n", datasize, compressed_size);
+					work_received = decompressed_size;
+				} else{
+					ret = MPI_Recv(work, work_received, MPI_CHAR, steal_neighbor,
+						       MSG_JOB_STEAL_RESPONSE, pfind_com,
+						       MPI_STATUS_IGNORE);
+				}
+#endif
+				CHECK_MPI
+
+				work_received /= sizeof(work_t);
+				break;
+			}
+			// job stealing request
+			ret = MPI_Iprobe(MPI_ANY_SOURCE, MSG_JOB_STEAL, pfind_com,
+					 & has_msg, MPI_STATUS_IGNORE);
+			CHECK_MPI
+			if(has_msg){
+				res->monitor.job_steal_inbound++;
+				ret = MPI_Recv(NULL, 0, MPI_INT, MPI_ANY_SOURCE, MSG_JOB_STEAL,
+					       pfind_com, & wait_status);
+				CHECK_MPI
+				int requesting_rank = wait_status.MPI_SOURCE;
+				ret = MPI_Send(NULL, 0, MPI_CHAR, requesting_rank,
+					       MSG_JOB_STEAL_RESPONSE, pfind_com);
+				CHECK_MPI
+			}
+		}
+		debug("[%d] stole %d \n", pfind_rank, work_received);
+		pending_work = work_received;
+		res->monitor.work_stolen += work_received;
+		res->monitor.job_steal_mpitime_us += pfind_timer_diff_usec(& t_start);
+	}
+	return 0;
+}
+
 static char  find_file_type(unsigned char c) {
     switch (c) {
         case DT_BLK :
@@ -535,7 +689,10 @@ static int find_do_readdir(char *path, int idx) {
 		for (i=0 ; i<nr; i++) {
 			sprintf(tmp, "~~%d:%s", i, path);
 			//printf("enqueue %s\n", tmp);
-			enqueue_work('d', tmp);
+			if (enqueue_work('d', tmp)) {
+				enqueue_dir_excess(tmp, NULL);
+			}
+			check_steal_req();
 		}
 		pfind_dfs_closedir(d);
 		return 0;
@@ -552,7 +709,8 @@ static int find_do_readdir(char *path, int idx) {
 
 	while (1) {
 		//printf("find_do_readdir %s\n", path);
-
+		check_steal_req();
+		
 		struct dirent *entry;
 		uint64_t nr_scanned;
 
@@ -585,7 +743,7 @@ static int find_do_readdir(char *path, int idx) {
 		char typ = find_file_type(entry->d_type);
 
 		if (typ == 'd')
-			res->total_files --;		
+			res->total_files --;
 		if (typ != 'd') {
 			if(! runtime.needs_stat){
 				// optimization to skip stat
@@ -595,22 +753,33 @@ static int find_do_readdir(char *path, int idx) {
 				}
 				continue;
 			}
+#if 1
+			else {
+				find_do_lstat(newpath);
+			}
+			continue;
+#endif
 		}
 
-		// we need to perform a stat operation
+
+#if 1
 		if (enqueue_work(typ, newpath)) {
 			if(typ == 'd') {
-				static int printed_warning = 0;
 				if(! printed_warning){
 					printf("[%d] WARNING, utilizing excess queue for processing of the directory %s as the queue is full, supressing further messages. This may lead to suboptimal performance. Try to increase the queue size.\n", pfind_rank, entry->d_name);
 					printed_warning = 1;
 				}
-				enqueue_dir_excess(newpath, entry->d_name);
+				enqueue_dir_excess(newpath, NULL);
+				continue;
 			} else {
 				find_do_lstat(newpath);
+				continue;
 			}
+			assert(0);
 			return 1;
 		}
+		check_steal_req();
+#endif
 	}
 	pfind_dfs_closedir(d);
 	return 0;
