@@ -34,7 +34,6 @@ int pfind_rank;
 int pfind_size;
 MPI_Comm pfind_com;
 
-
 //#define debug printf
 #define debug(...)
 
@@ -45,6 +44,11 @@ MPI_Comm pfind_com;
 static char start_dir[PFIND_PATH_MAX]; // absolute path of start directory
 static int start_dir_length;
 static int msg_type_flag = 0;
+
+#ifdef LZ4
+int max_compressed;
+char * compress_buf;
+#endif
 
 static pfind_options_t * opt;
 static pfind_find_results_t * res = NULL;
@@ -74,11 +78,6 @@ typedef struct{
   int capacity;
   int size;
 } work_excess_dir_t;
-
-typedef struct{
-  DIR * dir;
-  char name[PFIND_PATH_MAX];
-} currently_processed_dir_t;
 
 // queue of work
 static work_t * work;
@@ -139,18 +138,26 @@ static int enqueue_work(char typ, char * path){
   return 0;
 }
 
-static void find_process_one_item2() {
+static void find_process_one_item() {
+	int idx;
+	char tmp_path[PFIND_PATH_MAX];
+
 	// opt->queue_length
 	if(excess_dirs.size > 0){
 		excess_dirs.size--;
+
+		if (strncmp(excess_dirs.dirs[excess_dirs.size].name, "~~", 2) == 0) { 
+			sscanf(excess_dirs.dirs[excess_dirs.size].name, "~~%d:%s", &idx, tmp_path);
+		} else {
+			strcpy(tmp_path, excess_dirs.dirs[excess_dirs.size].name);
+			idx = -1;
+		}
 		find_do_readdir(excess_dirs.dirs[excess_dirs.size].name, -1);
 		return;
 	}
 	pending_work--;
 
 	work_t * cur = & work[pending_work];
-	int idx;
-	char tmp_path[PFIND_PATH_MAX];
 
 	if( cur->type != 'd') {
 		find_do_lstat(cur->name);
@@ -219,8 +226,8 @@ pfind_find_results_t * pfind_find(pfind_options_t * lopt){
   memset(res, 0, sizeof(*res));
 
   #ifdef LZ4
-    int max_compressed = LZ4_COMPRESSBOUND(opt->queue_length * sizeof(work_t) / 2);
-    char * compress_buf = smalloc(max_compressed);
+  max_compressed = LZ4_COMPRESSBOUND(opt->queue_length * sizeof(work_t) / 2);
+  compress_buf = smalloc(max_compressed);
   #endif
 
   if(opt->stonewall_timer != 0){
@@ -264,7 +271,7 @@ pfind_find_results_t * pfind_find(pfind_options_t * lopt){
         }
         pending_work = 0;
       }else{
-        find_process_one_item2();
+        find_process_one_item();
       }
     }
 
@@ -460,6 +467,65 @@ pfind_find_results_t * pfind_aggregrate_results(pfind_find_results_t * local){
   return res;
 }
 
+static int check_steal_req()
+{
+	int has_msg, ret;
+	MPI_Status wait_status;
+
+	// check for job-stealing request
+	has_msg = 1;
+	while(has_msg){
+		ret = MPI_Iprobe(MPI_ANY_SOURCE, MSG_JOB_STEAL, pfind_com, & has_msg, & wait_status);
+		CHECK_MPI
+		if(has_msg){
+			int requesting_rank = wait_status.MPI_SOURCE;
+			ret = MPI_Recv(NULL, 0, MPI_INT, requesting_rank, MSG_JOB_STEAL, pfind_com, & wait_status);
+			CHECK_MPI
+			debug("[%d] msg ready from %d !\n", pfind_rank, requesting_rank);
+
+			int work_to_give = pending_work / 2;
+			if (work_to_give)
+				work_to_give = 1;
+			res->monitor.job_steal_inbound++;
+			res->monitor.work_send += work_to_give;
+
+			int datasize = sizeof(work_t)*work_to_give;
+			pending_work -= work_to_give;
+
+#ifndef LZ4
+			ret = MPI_Send(& work[pending_work], datasize, MPI_CHAR, requesting_rank,
+				       MSG_JOB_STEAL_RESPONSE, pfind_com);
+#else
+
+			if(datasize > 0){
+				int compressed_size;
+				compressed_size = LZ4_compress_default((char*) & work[pending_work],
+								       compress_buf, datasize, max_compressed);
+				ret = MPI_Send(compress_buf, compressed_size, MPI_CHAR, requesting_rank,
+					       MSG_JOB_STEAL_RESPONSE, pfind_com);
+			} else{
+				ret = MPI_Send(NULL, 0, MPI_CHAR, requesting_rank,
+					       MSG_JOB_STEAL_RESPONSE, pfind_com);
+			}
+#endif
+			CHECK_MPI
+
+			// move excess directory queue into the regular queue
+			if(excess_dirs.size > 0){
+				int to_move = work_to_give < excess_dirs.size ? work_to_give : excess_dirs.size;
+				int ex_pos = excess_dirs.size - 1;
+				//printf("Move %d ex_pos: %d Move: %d\n", pending_work, ex_pos, to_move);
+				for(int i = 0 ; i < to_move; i++, pending_work++, ex_pos--){
+					work[pending_work].type = 'd';
+					strcpy(work[pending_work].name, excess_dirs.dirs[ex_pos].name);
+				}
+				excess_dirs.size -= to_move;
+			}
+		}
+	}
+	return 0;
+}
+
 static char  find_file_type(unsigned char c) {
     switch (c) {
         case DT_BLK :
@@ -538,6 +604,7 @@ static int find_do_readdir(char *path, int idx) {
 			enqueue_work('d', tmp);
 		}
 		pfind_dfs_closedir(d);
+		check_steal_req();
 		return 0;
 	}
 
@@ -550,12 +617,12 @@ static int find_do_readdir(char *path, int idx) {
 		return 0;
 	}
 
-	int processed = 0;
-
 	while (1) {
 		//printf("find_do_readdir %s\n", path);
+		check_steal_req();
 
 		struct dirent *entry;
+
 		entry = pfind_dfs_readdir(d);
 		if (opt->stonewall_timer && MPI_Wtime() >= runtime.stonewall_endtime ){
 			if(opt->verbosity > 1){
@@ -579,7 +646,6 @@ static int find_do_readdir(char *path, int idx) {
 			continue;
 		}
 		res->checked_dirents++;
-		processed++;
 
 		char typ = find_file_type(entry->d_type);
 		if (typ == 'u'){
@@ -607,25 +673,6 @@ static int find_do_readdir(char *path, int idx) {
 				check_buf(buf, entry->d_name);
 				continue;
 			}
-		} else if (typ != 'd') {
-			assert(0);
-			// compare file name
-			if(opt->name_pattern && regexec(& opt->name_regex, entry->d_name, 0, NULL, 0) ){
-				res->total_files++;
-				if(opt->verbosity >= 2){
-					printf("Name does not match: %s\n", entry->d_name);
-				}
-				continue;
-			}
-			if(! runtime.needs_stat){
-				res->total_files++;
-				// optimization to skip stat
-				res->found_files++;
-				if(! opt->just_count){
-					fprintf(runtime.logfile, "%s/%s\n", path, entry->d_name);
-				}
-				continue;
-			}
 		}
 
 		// we need to perform a stat operation
@@ -640,6 +687,7 @@ static int find_do_readdir(char *path, int idx) {
 			} else {
 				find_do_lstat(newpath);
 			}
+			check_steal_req();
 			return 1;
 		}
 	}
