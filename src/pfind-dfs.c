@@ -346,6 +346,12 @@ pfind_init_daos(MPI_Comm comm) {
 	HandleDistribute(comm, CONT_HANDLE);
 	HandleDistribute(comm, DFS_HANDLE);
 
+	char *dfs_prefix = getenv("DAOS_PREFIX");
+	if (dfs_prefix != NULL) {
+		rc = dfs_set_prefix(pfind_dfs, dfs_prefix);
+		DCHECK(rc, "Failed to set DFS prefix\n");
+	}
+
         rc = d_hash_table_create(D_HASH_FT_EPHEMERAL | D_HASH_FT_NOLOCK | D_HASH_FT_LRU,
                                  4, NULL, &hdl_hash_ops, &dir_hash);
 	DCHECK(rc, "Failed to initialize dir hashtable");
