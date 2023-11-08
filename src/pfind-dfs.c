@@ -15,9 +15,6 @@
 
 #include <gurt/common.h>
 #include <gurt/hash.h>
-#include <daos.h>
-#include <daos_fs.h>
-
 #include "pfind-dfs.h"
 
 /* For DAOS methods. */
@@ -54,12 +51,15 @@ struct pfind_dir_hdl {
 };
 
 #define NUM_DIRENTS 112
+
 struct dfs_pfind_t {
-	dfs_obj_t *dir;
-	uint32_t num_ents;
-	uint32_t num_splits;
-	struct dirent ents[NUM_DIRENTS];
-	daos_anchor_t anchor;
+	dfs_obj_t	*dir;
+	uint32_t	num_ents;
+	uint32_t	num_splits;
+	struct dirent	ents[NUM_DIRENTS];
+	daos_obj_id_t   oids[NUM_DIRENTS];
+	daos_size_t     csizes[NUM_DIRENTS];
+	daos_anchor_t	anchor;
 };
 
 static inline struct pfind_dir_hdl *
@@ -162,6 +162,7 @@ HandleDistribute(MPI_Comm comm, enum handleType type)
         free(global.iov_buf);
 }
 
+#if 0
 static int
 parse_filename(const char *path, char **_obj_name, char **_cont_name)
 {
@@ -227,7 +228,6 @@ out:
 	return rc;
 }
 
-#if 0
 static int
 share_file_handle(dfs_obj_t **file, MPI_Comm comm)
 {
@@ -362,6 +362,11 @@ void
 pfind_fini_daos(MPI_Comm comm) {
 	int rc;
 
+	if (dpipe) {
+		rc = dfs_pipeline_destroy(dpipe);
+		DCHECK(rc, "Failed to destroy pipeline");
+	}
+
         while (1) {
                 d_list_t *rlink = NULL;
 
@@ -445,7 +450,8 @@ int pfind_dfs_closedir(DIR* _dirp)
     return rc;
 }
 
-struct dirent* pfind_dfs_readdir(DIR* _dirp, uint64_t *_nr_scanned)
+struct dirent* pfind_dfs_readdir(DIR* _dirp, daos_obj_id_t *oid, daos_size_t *csize,
+				 uint64_t *_nr_scanned)
 {
     int rc;
     uint64_t nr_scanned = 0, tot_scanned = 0;
@@ -458,9 +464,10 @@ struct dirent* pfind_dfs_readdir(DIR* _dirp, uint64_t *_nr_scanned)
 
     while (!daos_anchor_is_eof(&dirp->anchor)) {
 	    rc = dfs_readdir_with_filter(pfind_dfs, dirp->dir, dpipe, &dirp->anchor,
-					 &dirp->num_ents, dirp->ents, &nr_scanned);
+					 &dirp->num_ents, dirp->ents, dirp->oids, dirp->csizes,
+					 &nr_scanned);
 	    if (rc) {
-		    fprintf(stderr, "dfs_readdir_with_filter failed %d\n", rc);
+		    fprintf(stderr, "%d: dfs_readdir_with_filter failed %d\n", pfind_rank, rc);
 		    return NULL;
 	    }
 
@@ -477,32 +484,25 @@ struct dirent* pfind_dfs_readdir(DIR* _dirp, uint64_t *_nr_scanned)
 ret:
     *_nr_scanned = tot_scanned;
     dirp->num_ents--;
+    if (oid) {
+	    oid->hi = dirp->oids[dirp->num_ents].hi;
+	    oid->lo = dirp->oids[dirp->num_ents].lo;
+    }
+    if (csize) {
+	    *csize = dirp->csizes[dirp->num_ents];
+    }
     return &dirp->ents[dirp->num_ents];
 }
 
-int pfind_dfs_lstat(const char* path, struct stat* buf)
+int pfind_dfs_lstat(const char *path, daos_obj_id_t *oid, daos_size_t csize, struct stat* buf)
 {
     int rc;
-    dfs_obj_t *parent = NULL;
-    char *name = NULL, *dir_name = NULL;
 
-    parse_filename(path, &name, &dir_name);
-
-    assert(dir_name);
-
-    parent = lookup_insert_dir(dir_name, NULL);
-    if (parent == NULL) {
-	    fprintf(stderr, "dfs_lookup %s failed \n", dir_name);
-	    return ENOENT;
-    }
-
-    rc = dfs_stat(pfind_dfs, parent, name, buf);
-    if (rc) {
-	    fprintf(stderr, "dfs_stat %s failed (%d)\n", name, rc);
-	    return rc;
-    }
-
-    return 0;
+    assert(oid != NULL);
+    rc = dfs_get_size_by_oid(pfind_dfs, *oid, csize, (daos_size_t *)(&buf->st_size));
+    if (rc)
+	    fprintf(stderr, "dfs_get_size_by_oid with path %s failed: (%d)\n", path, rc); 	    
+    return rc;
 }
 
 int pfind_dfs_set_filter(time_t ctime_min, const char *name)

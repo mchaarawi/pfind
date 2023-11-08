@@ -29,11 +29,9 @@
 #define MSG_JOB_STEAL 800
 #define MSG_JOB_STEAL_RESPONSE 820
 
-
 int pfind_rank;
 int pfind_size;
 MPI_Comm pfind_com;
-
 
 //#define debug printf
 #define debug(...)
@@ -65,7 +63,7 @@ typedef struct{
 
 static pfind_runtime_options_t runtime;
 static int find_do_readdir(char *path, int idx);
-static void find_do_lstat(char *path);
+static void find_do_lstat(char *path, daos_obj_id_t *oid, daos_size_t csize);
 
 typedef struct {
   char name[PFIND_PATH_MAX];
@@ -163,7 +161,7 @@ static void find_process_one_item() {
 	work_t * cur = & work[pending_work];
 
 	if( cur->type != 'd') {
-		find_do_lstat(cur->name);
+		find_do_lstat(cur->name, NULL, 0);
 		return;
 	}
 
@@ -221,12 +219,9 @@ pfind_find_results_t * pfind_find(pfind_options_t * lopt){
   if(opt->timestamp_file || opt->size != UINT64_MAX){
     runtime.needs_stat = 1;
   }
-  //ior_aiori_t * backend = aiori_select(opt->backend_name);
+
   work = smalloc(sizeof(work_t) * (opt->queue_length + 1 ));
-  MPI_Barrier(pfind_com);
-  double start = MPI_Wtime();
   strcpy(start_dir, opt->workdir);
-  //char * err = realpath(opt->workdir, start_dir);
   res = smalloc(sizeof(pfind_find_results_t));
   memset(res, 0, sizeof(*res));
 
@@ -234,27 +229,21 @@ pfind_find_results_t * pfind_find(pfind_options_t * lopt){
     max_compressed = LZ4_COMPRESSBOUND(opt->queue_length * sizeof(work_t) / 2);
     compress_buf = smalloc(max_compressed);
   #endif
-
+    
   if(opt->stonewall_timer != 0){
     runtime.stonewall_endtime = MPI_Wtime() + opt->stonewall_timer;
   }else{
     runtime.stonewall_endtime = 0;
   }
 
-  //int nr = -1, i;
-  //DIR * sd = pfind_dfs_opendir(start_dir, &nr);
-  //if (!sd) {
-  //fprintf (stderr, "Pfind: cannot open directory '%s': %s\n", start_dir, strerror (errno));
-  //free(work);
-  //free(res);
-  //pfind_abort("");
-  //}
   start_dir_length = strlen(start_dir);
+
+  MPI_Barrier(pfind_com);
+  double start = MPI_Wtime();
 
   // startup, load current directory
   if(pfind_rank == 0){
     work[0].type = 'd';
-    //work[0].name[0] = 0;
     strcpy(work[0].name, start_dir);
     pending_work++;
   }
@@ -265,7 +254,6 @@ pfind_find_results_t * pfind_find(pfind_options_t * lopt){
   int phase = 0; // 1 == potential cleanup; 2 == stop query; 3 == terminate
 
   while(! msg_type_flag){
-    //usleep(100000);
     int have_completed = (pending_work == 0 && excess_dirs.size == 0);
     debug("[%d] processing: %d [%d, %d, phase: %d]\n", pfind_rank, pending_work, have_finalize_token, have_processed_work_after_token, phase);
     // do we have more work?
@@ -311,7 +299,12 @@ pfind_find_results_t * pfind_find(pfind_options_t * lopt){
         res->monitor.completion_tokens_send++;
         // we received the finalization token
         if (phase == 3){
-          break;
+		if (pfind_rank == 0) {
+			ret = MPI_Recv(& phase, 1, MPI_INT, left_neighbor, MSG_COMPLETE,
+				       pfind_com, MPI_STATUS_IGNORE);
+			CHECK_MPI
+		}
+		break;
         }
         have_processed_work_after_token = 0;
         have_finalize_token = 0;
@@ -460,22 +453,23 @@ pfind_find_results_t * pfind_find(pfind_options_t * lopt){
   res->rate = res->total_files / res->runtime;
   res->com = pfind_com;
 
+  MPI_Barrier(pfind_com);
   pfind_fini_daos(pfind_com);
   return res;
 }
 
 pfind_find_results_t * pfind_aggregrate_results(pfind_find_results_t * local){
-  pfind_find_results_t * res = smalloc(sizeof(pfind_find_results_t));
-  if(! res){
+  pfind_find_results_t * res_tmp = smalloc(sizeof(pfind_find_results_t));
+  if(! res_tmp){
     pfind_abort("No memory");
   }
-  memcpy(res, local, sizeof(*res));
+  memcpy(res_tmp, local, sizeof(*res_tmp));
 
-  MPI_Reduce(pfind_rank == 0 ? MPI_IN_PLACE : & res->errors, & res->errors, 5, MPI_LONG_LONG_INT, MPI_SUM, 0, local->com);
-  MPI_Reduce(pfind_rank == 0 ? MPI_IN_PLACE : & res->runtime, & res->runtime, 1, MPI_DOUBLE, MPI_MAX, 0, local->com);
+  MPI_Reduce(pfind_rank == 0 ? MPI_IN_PLACE : & res_tmp->errors, & res_tmp->errors, 5, MPI_LONG_LONG_INT, MPI_SUM, 0, local->com);
+  MPI_Reduce(pfind_rank == 0 ? MPI_IN_PLACE : & res_tmp->runtime, & res_tmp->runtime, 1, MPI_DOUBLE, MPI_MAX, 0, local->com);
 
-  res->rate = res->total_files / res->runtime;
-  return res;
+  res_tmp->rate = res_tmp->total_files / res_tmp->runtime;
+  return res_tmp;
 }
 
 static int check_steal_req()
@@ -639,14 +633,6 @@ static char  find_file_type(unsigned char c) {
 
 static void check_buf(struct stat buf, char * path){
     // compare values
-    if(opt->timestamp_file){
-      if( (uint64_t) buf.st_ctime < runtime.ctime_min ){
-        if(opt->verbosity >= 2){
-          printf("Timestamp too small: %s\n", path);
-        }
-        return;
-      }
-    }
     if(opt->size != UINT64_MAX){
       uint64_t size = (uint64_t) buf.st_size;
       if(size != opt->size){
@@ -662,7 +648,7 @@ static void check_buf(struct stat buf, char * path){
     res->found_files++;
 }
 
-static void find_do_lstat(char *path) {
+static void find_do_lstat(char *path, daos_obj_id_t *oid, daos_size_t csize) {
 	struct stat buf;
 
 	// filename comparison has been done already
@@ -670,7 +656,7 @@ static void find_do_lstat(char *path) {
 		printf("STAT: %s\n", path);
 	}
 
-	if (pfind_dfs_lstat(path, &buf) == 0) {
+	if (pfind_dfs_lstat(path, oid, csize, &buf) == 0) {
 		check_buf(buf, path);
 	} else {
 		res->errors++;
@@ -712,12 +698,13 @@ static int find_do_readdir(char *path, int idx) {
 		check_steal_req();
 		
 		struct dirent *entry;
+		daos_obj_id_t entry_oid;
+		daos_size_t entry_csize = 0;
 		uint64_t nr_scanned;
 
-		entry = pfind_dfs_readdir(d, &nr_scanned);
+		entry = pfind_dfs_readdir(d, &entry_oid, &entry_csize, &nr_scanned);
 		res->checked_dirents += nr_scanned;
 		res->total_files += nr_scanned;
-
 		if (opt->stonewall_timer && MPI_Wtime() >= runtime.stonewall_endtime ){
 			if(opt->verbosity > 1){
 				fprintf(runtime.logfile, "Hit stonewall at %.2fs\n", MPI_Wtime());
@@ -746,6 +733,7 @@ static int find_do_readdir(char *path, int idx) {
 			res->total_files --;
 		if (typ != 'd') {
 			if(! runtime.needs_stat){
+				assert(0);
 				// optimization to skip stat
 				res->found_files++;
 				if(! opt->just_count){
@@ -753,16 +741,12 @@ static int find_do_readdir(char *path, int idx) {
 				}
 				continue;
 			}
-#if 1
 			else {
-				find_do_lstat(newpath);
+				find_do_lstat(newpath, &entry_oid, entry_csize);
 			}
 			continue;
-#endif
 		}
 
-
-#if 1
 		if (enqueue_work(typ, newpath)) {
 			if(typ == 'd') {
 				if(! printed_warning){
@@ -772,14 +756,14 @@ static int find_do_readdir(char *path, int idx) {
 				enqueue_dir_excess(newpath, NULL);
 				continue;
 			} else {
-				find_do_lstat(newpath);
+				assert(0);
+				find_do_lstat(newpath, &entry_oid, entry_csize);
 				continue;
 			}
 			assert(0);
 			return 1;
 		}
-		check_steal_req();
-#endif
+		//check_steal_req();
 	}
 	pfind_dfs_closedir(d);
 	return 0;
