@@ -6,7 +6,7 @@ DAOS=${MY_DAOS_INSTALL_PATH}
 # Regular options, set on the command line CC
 CC="${CC:-mpicc}"
 CFLAGS="-g -O2 -Wextra -Wall -pipe -std=gnu99 -Wno-format-overflow -I$DAOS/include/"
-LDFLAGS="-L$DAOS/lib64/ -ldfs -ldaos -lgurt"
+LDFLAGS="-L$DAOS/lib64/ -ldfs -ldaos -lgurt -lmpi"
 
 # Test settings
 #CC="${CC:-gcc-10}"
