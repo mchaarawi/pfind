@@ -700,7 +700,7 @@ static int find_do_readdir(char *path, int idx) {
 		struct dirent *entry;
 		daos_obj_id_t entry_oid;
 		daos_size_t entry_csize = 0;
-		uint64_t nr_scanned;
+		uint64_t nr_scanned = 0;
 
 		entry = pfind_dfs_readdir(d, &entry_oid, &entry_csize, &nr_scanned);
 		res->checked_dirents += nr_scanned;
@@ -765,6 +765,7 @@ static int find_do_readdir(char *path, int idx) {
 		}
 		//check_steal_req();
 	}
-	pfind_dfs_closedir(d);
+	if (pfind_dfs_closedir(d))
+		res->errors++;
 	return 0;
 }

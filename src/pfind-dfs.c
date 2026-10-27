@@ -56,6 +56,7 @@ struct dfs_pfind_t {
 	dfs_obj_t	*dir;
 	uint32_t	num_ents;
 	uint32_t	num_splits;
+	int		error;
 	struct dirent	ents[NUM_DIRENTS];
 	daos_obj_id_t   oids[NUM_DIRENTS];
 	daos_size_t     csizes[NUM_DIRENTS];
@@ -432,6 +433,12 @@ DIR* pfind_dfs_opendir(const char* dir, int *nr)
 	    free(dirp);
 	    return NULL;
     }
+    /*
+     * DIOF_TO_SPEC_SHARD (daos/object.h). Since DAOS-17224 dfs_obj_anchor_set()
+     * only sets DIOF_TO_SPEC_GROUP, which the pipeline client ignores: on EOF it
+     * advances to the next shard, so one split would walk the rest of the dir.
+     */
+    dirp->anchor.da_flags |= 0x2;
 
 done:
     return (DIR *)dirp;
@@ -445,7 +452,7 @@ int pfind_dfs_closedir(DIR* _dirp)
     //rc = dfs_release(dirp->dir);
     //if (rc)
     //return rc;
-    rc = 0;
+    rc = dirp->error;
     free(dirp);
     return rc;
 }
@@ -468,6 +475,9 @@ struct dirent* pfind_dfs_readdir(DIR* _dirp, daos_obj_id_t *oid, daos_size_t *cs
 					 &nr_scanned);
 	    if (rc) {
 		    fprintf(stderr, "%d: dfs_readdir_with_filter failed %d\n", pfind_rank, rc);
+		    dirp->num_ents = 0;
+		    dirp->error = rc;
+		    *_nr_scanned = tot_scanned;
 		    return NULL;
 	    }
 
