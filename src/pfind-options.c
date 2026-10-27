@@ -34,6 +34,7 @@ pfind_options_t * pfind_parse_args(int argc, char ** argv, int force_print_help,
   res->verbosity = 0;
   res->timestamp_file = NULL;
   res->name_pattern = NULL;
+  res->name_like = NULL;
   res->size = UINT64_MAX;
   res->queue_length = 100000;
   res->max_entries_per_iter = 1000;
@@ -74,23 +75,36 @@ pfind_options_t * pfind_parse_args(int argc, char ** argv, int force_print_help,
       argv[++i][0] = 0;
     }else if(strcmp(argv[i], "-name") == 0){
       res->name_pattern = malloc(strlen(argv[i+1])*4+100);
-      // transform a traditional name pattern to a regex:
+      res->name_like = malloc(strlen(argv[i+1])*2+1);
+      // transform a traditional name pattern to a regex (client) and a LIKE pattern (server):
       char * str = argv[i+1];
       char * out = res->name_pattern;
+      char * like = res->name_like;
       int pos = 0;
+      int lpos = 0;
       for(unsigned i=0; i < strlen(str); i++){
         if(str[i] == '*'){
           pos += sprintf(out + pos, ".*");
+          like[lpos++] = '%';
+        }else if(str[i] == '?'){
+          pos += sprintf(out + pos, ".");
+          like[lpos++] = '_';
         }else if(str[i] == '.'){
           pos += sprintf(out + pos, "[.]");
+          like[lpos++] = '.';
         }else if(str[i] == '"' || str[i] == '\"'){
           // erase the "
         }else{
           out[pos] = str[i];
           pos++;
+          if(str[i] == '%' || str[i] == '_' || str[i] == '\\'){
+            like[lpos++] = '\\';
+          }
+          like[lpos++] = str[i];
         }
       }
       out[pos] = 0;
+      like[lpos] = 0;
 
       int ret = regcomp(& res->name_regex, res->name_pattern, 0);
       if(ret){

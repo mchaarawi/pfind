@@ -24,6 +24,7 @@ typedef struct {
 
   char * timestamp_file;
   char * name_pattern;
+  char * name_like;   // -name translated to a SQL LIKE pattern for server-side filtering (NULL for -regex)
   regex_t name_regex;
   uint64_t size;
   // optimizing parameters

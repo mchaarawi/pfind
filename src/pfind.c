@@ -1,746 +1,561 @@
+/*
+ * pfind core for the DAOS DFS pipeline backend, designed for O(100K) ranks.
+ *
+ * Work items are (directory path, split range). A directory is first split into
+ * its enumeration shards; ranges are bisected on processing so a huge directory
+ * spreads across ranks in O(log n) steal steps. The local queue grows on demand
+ * (no overflow side queue).
+ *
+ * Stealing is non-blocking: a thief posts one request and keeps serving other
+ * ranks and progressing termination while waiting; victims give half their
+ * queue. Failed steals back off exponentially so idle ranks don't flood the
+ * fabric.
+ *
+ * Termination uses Mattern-style counting waves over MPI_Iallreduce (sent/received
+ * item counters + busy/dirty flags) instead of a ring token, so it costs
+ * O(log N) per wave regardless of how many ranks are idle or busy.
+ */
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <string.h>
 #include <errno.h>
 #include <dirent.h>
 #include <limits.h>
-#include <sys/stat.h>
-#include <mpi.h>
-#include <fcntl.h>
 #include <unistd.h>
 #include <assert.h>
-#include <sys/time.h>
-
-#ifdef LZ4
-#include <lz4.h>
-#endif
+#include <regex.h>
+#include <mpi.h>
 
 #include "pfind-options.h"
+#include "pfind-dfs.h"
 
-#ifndef PATH_MAX
-#define PATH_MAX 4096
-#warning "Could not detect PATH_MAX"
-#endif
+#define PFIND_PATH_MAX 256
 
-#define MSG_COMPLETE 777
-#define MSG_JOB_STEAL 800
-#define MSG_JOB_STEAL_RESPONSE 820
+#define TAG_STEAL_REQ  800
+#define TAG_STEAL_RESP 820
 
+#define MAX_GIVE            4096      /* items per steal response */
+#define STEAL_BACKOFF_MIN   20e-6     /* seconds */
+#define STEAL_BACKOFF_MAX   5e-3
+#define TERM_WAVE_INTERVAL  10e-3
 
 int pfind_rank;
 int pfind_size;
 MPI_Comm pfind_com;
 
-
-//#define debug printf
-#define debug(...)
-
-// this version is based on mpistat
-// parallel recursive find
-
-// globals
-static char start_dir[PATH_MAX]; // absolute path of start directory
-static int start_dir_length;
-static int msg_type_flag = 0;
-
-static pfind_options_t * opt;
-static pfind_find_results_t * res = NULL;
-
-typedef struct{
-  uint64_t    ctime_min;
-  double      stonewall_endtime;
-  FILE *      logfile;
-  int         needs_stat;
-} pfind_runtime_options_t;
-
-static pfind_runtime_options_t runtime;
-static int find_do_readdir(char *path, uint64_t dir_start, uint64_t dir_end);
-static void find_do_lstat(char *path);
+#define CHECK_MPI(ret) do { if ((ret) != MPI_SUCCESS) { fprintf(stderr, "rank %d: MPI error at %s:%d\n", pfind_rank, __FILE__, __LINE__); MPI_Abort(MPI_COMM_WORLD, 1); } } while (0)
 
 typedef struct {
-  char name[PATH_MAX];
-  uint64_t dir_start; // start position to read a directory
-  uint64_t dir_end;   // end position to read a directory
-  char type; // 'd' for directory
+  uint32_t lo;
+  uint32_t hi;                  /* hi == 0: directory not split yet */
+  char path[PFIND_PATH_MAX];
 } work_t;
 
-typedef struct { // a directory work item, that is fetched in excess of processing capabilities
-  char name[PATH_MAX];
-} work_dir_t;
+typedef struct {
+  uint64_t ctime_min;
+  double stonewall_endtime;
+  int stonewall_hit;
+  FILE *logfile;
+  int needs_size;
+  int client_regex;             /* -regex given: name match done on the client */
+} pfind_runtime_t;
 
-typedef struct{
-  work_dir_t * dirs;
-  int capacity;
-  int size;
-} work_excess_dir_t;
+static pfind_options_t *opt;
+static pfind_runtime_t runtime;
+static pfind_find_results_t *res;
+static int printed_warning;
 
-typedef struct{
-  DIR * dir;
-  char name[PATH_MAX];
-  uint64_t pos_cur;
-  uint64_t pos_end;
-} currently_processed_dir_t;
+/* ---------------------------------------------------------------- queue */
 
-static currently_processed_dir_t current_dir = {NULL};
+static work_t *q;
+static size_t q_cap, q_head, q_tail;    /* live items in [q_head, q_tail) */
 
-// queue of work
-static work_t * work;
-
-// additional directories
-work_excess_dir_t excess_dirs = {NULL, 0, 0};
-
-// amount of pending_work
-static int pending_work = 0;
-
-static void* smalloc(size_t size){
-  void * p = malloc(size);
-  memset(p, 0, size);
-  if(p == NULL){
-    printf("Cannot allocate %zd bytes of memory\nAborting\n", size);
-    exit(1);
+static void *smalloc(size_t size){
+  void *p = malloc(size);
+  if (p == NULL) {
+    fprintf(stderr, "rank %d: cannot allocate %zu bytes\n", pfind_rank, size);
+    MPI_Abort(MPI_COMM_WORLD, 1);
   }
+  memset(p, 0, size);
   return p;
 }
 
-static void pfind_timer_start(struct timeval * timer){
-  if (gettimeofday(timer, (struct timezone *)NULL) != 0){
-    printf("Error using gettimeofday()");
-    exit(1);
-  }
+static inline size_t q_count(void){
+  return q_tail - q_head;
 }
 
-static uint64_t pfind_timer_diff_usec(struct timeval * start){
-        struct timeval timer;
-        pfind_timer_start(& timer);
-        uint64_t time = (timer.tv_sec - start->tv_sec) * 1000000 + (timer.tv_usec - start->tv_usec);
-        return time;
-}
-
-static void enqueue_dir_access(char * path, char * entry){
-
-  if(excess_dirs.capacity == excess_dirs.size){
-    int newcapacity = excess_dirs.size * 2 + 5;
-    excess_dirs.dirs = realloc(excess_dirs.dirs, newcapacity * sizeof(work_dir_t));
-    excess_dirs.capacity = newcapacity;
-  }
-  sprintf(excess_dirs.dirs[excess_dirs.size].name, "%s/%s", path, entry);
-
-  excess_dirs.size++;
-}
-
-static int enqueue_work(char typ, char * path, char * entry){
-  int ret = pending_work >= opt->queue_length;
-  if (ret){
-    return 1;
-  }
-
-  work[pending_work].type = typ;
-  work[pending_work].dir_end = 0;
-  work[pending_work].dir_start = 0;
-  sprintf(work[pending_work].name, "%s/%s", path, entry);
-  //printf("Queuing: %s\n", work[pending_work].name);
-  pending_work++;
-  return 0;
-}
-
-static void find_process_one_item(){
-  if(current_dir.dir){
-    find_do_readdir(current_dir.name, current_dir.pos_cur, current_dir.pos_end);
+static void q_reserve(size_t extra){
+  if (q_tail + extra <= q_cap)
     return;
+  size_t n = q_count();
+  if (q_head > 0) {
+    memmove(q, q + q_head, n * sizeof(work_t));
+    q_head = 0;
+    q_tail = n;
+    if (q_tail + extra <= q_cap)
+      return;
   }
-
-  // opt->queue_length
-  if(excess_dirs.size > 0){
-    excess_dirs.size--;
-    find_do_readdir(excess_dirs.dirs[excess_dirs.size].name, 0, 0);
-    return;
+  size_t ncap = q_cap ? q_cap : 1024;
+  while (ncap < n + extra)
+    ncap *= 2;
+  work_t *nq = realloc(q, ncap * sizeof(work_t));
+  if (nq == NULL) {
+    fprintf(stderr, "rank %d: cannot grow work queue to %zu items\n", pfind_rank, ncap);
+    MPI_Abort(MPI_COMM_WORLD, 1);
   }
-  pending_work--;
-
-  work_t * cur = & work[pending_work];
-  if( cur->type == 'd'){
-    find_do_readdir(cur->name, cur->dir_start, cur->dir_end);
-  }else{
-    find_do_lstat(cur->name);
-  }
+  q = nq;
+  q_cap = ncap;
 }
 
-#define CHECK_MPI if(ret != MPI_SUCCESS){ printf("ERROR in %d\n", __LINE__); exit (1); }
+static void q_push(const work_t *w){
+  q_reserve(1);
+  q[q_tail++] = *w;
+}
 
-pfind_find_results_t * pfind_find(pfind_options_t * lopt){
-  opt = lopt;
-  memset(& runtime, 0, sizeof(pfind_runtime_options_t));
-  int ret;
+static int q_pop(work_t *w){
+  if (q_count() == 0)
+    return 0;
+  *w = q[--q_tail];
+  if (q_tail == q_head)
+    q_head = q_tail = 0;
+  return 1;
+}
 
-  if(opt->timestamp_file){
-    if(pfind_rank==0) {
-        static struct stat timer_file;
-        if(lstat(opt->timestamp_file, & timer_file) != 0) {
-          printf("Could not open: \"%s\", error: %s", opt->timestamp_file, strerror(errno));
-          pfind_abort("\n");
-        }
-        runtime.ctime_min = timer_file.st_ctime;
+/* remove k items from the steal end (oldest, i.e. highest in the tree) */
+static void q_take_front(size_t k, work_t *dst){
+  memcpy(dst, q + q_head, k * sizeof(work_t));
+  q_head += k;
+  if (q_head == q_tail)
+    q_head = q_tail = 0;
+}
+
+static void q_clear(void){
+  q_head = q_tail = 0;
+}
+
+/* ------------------------------------------------------- steal protocol */
+
+/* counters for termination detection: items transferred between ranks */
+static uint64_t items_sent;
+static uint64_t items_recv;
+static int dirty;                       /* received items since last wave report */
+
+struct resp_send {
+  MPI_Request req;
+  work_t *buf;
+  struct resp_send *next;
+};
+static struct resp_send *resp_list;
+
+static int steal_victim = -1;           /* rank we have a request pending to */
+static MPI_Request steal_req = MPI_REQUEST_NULL;
+static double steal_start;
+static int failed_steals;
+static double backoff_until;
+static unsigned int rand_seed;
+
+static void reap_resp_sends(int wait_all){
+  struct resp_send **pp = &resp_list;
+  while (*pp) {
+    struct resp_send *r = *pp;
+    int done = 0;
+    if (wait_all) {
+      CHECK_MPI(MPI_Wait(&r->req, MPI_STATUS_IGNORE));
+      done = 1;
+    } else {
+      CHECK_MPI(MPI_Test(&r->req, &done, MPI_STATUS_IGNORE));
     }
-    MPI_Bcast(&runtime.ctime_min, 1, MPI_INT, 0, pfind_com);
+    if (done) {
+      *pp = r->next;
+      free(r->buf);
+      free(r);
+    } else {
+      pp = &r->next;
+    }
+  }
+}
+
+static void serve_steal_requests(void){
+  while (1) {
+    int flag;
+    MPI_Status st;
+    CHECK_MPI(MPI_Iprobe(MPI_ANY_SOURCE, TAG_STEAL_REQ, pfind_com, &flag, &st));
+    if (!flag)
+      return;
+    int src = st.MPI_SOURCE;
+    CHECK_MPI(MPI_Recv(NULL, 0, MPI_BYTE, src, TAG_STEAL_REQ, pfind_com, MPI_STATUS_IGNORE));
+    res->monitor.job_steal_inbound++;
+
+    size_t give = runtime.stonewall_hit ? 0 : q_count() / 2;
+    if (give > MAX_GIVE)
+      give = MAX_GIVE;
+
+    struct resp_send *r = smalloc(sizeof(*r));
+    if (give) {
+      r->buf = smalloc(give * sizeof(work_t));
+      q_take_front(give, r->buf);
+    }
+    CHECK_MPI(MPI_Isend(r->buf, give * sizeof(work_t), MPI_BYTE, src, TAG_STEAL_RESP, pfind_com, &r->req));
+    r->next = resp_list;
+    resp_list = r;
+    items_sent += give;
+    res->monitor.work_send += give;
+  }
+}
+
+static void progress_steal(void){
+  int flag, bytes;
+  MPI_Status st;
+
+  if (steal_victim < 0)
+    return;
+  CHECK_MPI(MPI_Iprobe(steal_victim, TAG_STEAL_RESP, pfind_com, &flag, &st));
+  if (!flag)
+    return;
+  CHECK_MPI(MPI_Get_count(&st, MPI_BYTE, &bytes));
+  size_t n = bytes / sizeof(work_t);
+  q_reserve(n);
+  CHECK_MPI(MPI_Recv(q + q_tail, bytes, MPI_BYTE, steal_victim, TAG_STEAL_RESP, pfind_com, MPI_STATUS_IGNORE));
+  if (!runtime.stonewall_hit)
+    q_tail += n;
+  items_recv += n;
+  CHECK_MPI(MPI_Wait(&steal_req, MPI_STATUS_IGNORE));
+
+  double now = MPI_Wtime();
+  res->monitor.job_steal_mpitime_us += (uint64_t)((now - steal_start) * 1e6);
+  if (n > 0) {
+    dirty = 1;
+    failed_steals = 0;
+    backoff_until = 0;
+    res->monitor.work_stolen += n;
+  } else {
+    double b = STEAL_BACKOFF_MIN * (double)(1u << (failed_steals > 12 ? 12 : failed_steals));
+    if (b > STEAL_BACKOFF_MAX)
+      b = STEAL_BACKOFF_MAX;
+    backoff_until = now + b;
+    failed_steals++;
+  }
+  steal_victim = -1;
+}
+
+static void maybe_steal(double now){
+  if (pfind_size == 1 || steal_victim >= 0 || q_count() > 0 || runtime.stonewall_hit)
+    return;
+  if (now < backoff_until)
+    return;
+
+  int victim;
+  if (opt->steal_from_next && pfind_rank > 0 && (rand_r(&rand_seed) & 1))
+    victim = pfind_rank - 1;
+  else
+    victim = (int)(rand_r(&rand_seed) % (unsigned)pfind_size);
+  if (victim == pfind_rank)
+    victim = (victim + 1) % pfind_size;
+
+  CHECK_MPI(MPI_Isend(NULL, 0, MPI_BYTE, victim, TAG_STEAL_REQ, pfind_com, &steal_req));
+  steal_victim = victim;
+  steal_start = now;
+  res->monitor.job_steal_tries++;
+}
+
+/* --------------------------------------------------- termination waves */
+
+static MPI_Request term_req = MPI_REQUEST_NULL;
+static uint64_t term_in[4], term_out[4];
+static uint64_t term_prev_sent, term_prev_recv;
+static int term_have_prev;
+static double term_last;
+
+/* returns 1 when global termination has been detected */
+static int progress_termination(int busy, double now){
+  int done;
+
+  if (term_req == MPI_REQUEST_NULL) {
+    if (now - term_last < TERM_WAVE_INTERVAL)
+      return 0;
+    term_in[0] = items_sent;
+    term_in[1] = items_recv;
+    term_in[2] = busy ? 1 : 0;
+    term_in[3] = dirty ? 1 : 0;
+    dirty = 0;
+    term_last = now;
+    CHECK_MPI(MPI_Iallreduce(term_in, term_out, 4, MPI_UINT64_T, MPI_SUM, pfind_com, &term_req));
+    res->monitor.completion_tokens_send++;
+    return 0;
   }
 
-  //printf("TIME: %lld", runtime.ctime_min);
+  CHECK_MPI(MPI_Test(&term_req, &done, MPI_STATUS_IGNORE));
+  if (!done)
+    return 0;
 
-  if(opt->results_dir && ! opt->just_count){
-    char outfile[10240];
-    sprintf(outfile, "%s/%d.txt", opt->results_dir, pfind_rank);
+  int quiet = term_out[2] == 0 && term_out[3] == 0 && term_out[0] == term_out[1];
+  int stable = term_have_prev && term_out[0] == term_prev_sent && term_out[1] == term_prev_recv;
+  term_prev_sent = term_out[0];
+  term_prev_recv = term_out[1];
+  term_have_prev = 1;
+  return quiet && stable;
+}
+
+/* -------------------------------------------------------- processing */
+
+struct scan_ctx {
+  const char *path;
+  size_t path_len;
+};
+
+static int name_matches(const char *name){
+  if (!runtime.client_regex)
+    return 1;
+  return regexec(&opt->name_regex, name, 0, NULL, 0) == 0;
+}
+
+static int scan_cb(pfind_entry_t *ents, uint32_t nr, uint64_t nr_scanned, void *arg){
+  struct scan_ctx *ctx = arg;
+
+  res->checked_dirents += nr_scanned;
+  res->total_files += nr_scanned;
+
+  for (uint32_t i = 0; i < nr; i++) {
+    pfind_entry_t *e = &ents[i];
+
+    if (e->type == DT_DIR) {
+      res->total_files--;
+      if (strcmp(e->name, ".") == 0 || strcmp(e->name, "..") == 0)
+        continue;
+      work_t w = { .lo = 0, .hi = 0 };
+      int len = snprintf(w.path, sizeof(w.path), "%s%s%s", ctx->path,
+                         ctx->path_len && ctx->path[ctx->path_len - 1] == '/' ? "" : "/", e->name);
+      if (len < 0 || (size_t)len >= sizeof(w.path)) {
+        res->errors++;
+        if (!printed_warning) {
+          fprintf(stderr, "rank %d: path too long (>%d), skipping %s/%s (further messages suppressed)\n",
+                  pfind_rank, PFIND_PATH_MAX, ctx->path, e->name);
+          printed_warning = 1;
+        }
+        continue;
+      }
+      q_push(&w);
+      continue;
+    }
+
+    if (!name_matches(e->name))
+      continue;
+
+    if (runtime.needs_size) {
+      if (e->type != DT_REG)
+        continue;
+      if (e->size_error) {
+        res->errors++;
+        continue;
+      }
+      if (e->size != opt->size)
+        continue;
+    } else if (e->type != DT_REG && e->type != DT_LNK) {
+      res->unknown_file++;
+      continue;
+    }
+
+    res->found_files++;
+    if (!opt->just_count)
+      fprintf(runtime.logfile, "%s/%s\n", ctx->path, e->name);
+  }
+
+  /* keep other ranks moving while this split is being scanned */
+  serve_steal_requests();
+  reap_resp_sends(0);
+  progress_termination(1, MPI_Wtime());
+
+  return opt->stonewall_timer && MPI_Wtime() >= runtime.stonewall_endtime;
+}
+
+static void process_item(work_t *w){
+  pfind_dir_t *dir;
+  int rc;
+
+  rc = pfind_dfs_dir_open(w->path, &dir);
+  if (rc) {
+    res->errors++;
+    if (opt->verbosity > 1)
+      fprintf(runtime.logfile, "Cannot open '%s': %s\n", w->path, strerror(rc));
+    return;
+  }
+
+  if (w->hi == 0) {
+    uint32_t nr = 0;
+    rc = pfind_dfs_dir_nsplits(dir, &nr);
+    if (rc || nr == 0) {
+      res->errors++;
+      fprintf(stderr, "rank %d: cannot split '%s': %s\n", pfind_rank, w->path, strerror(rc ? rc : EINVAL));
+      return;
+    }
+    w->lo = 0;
+    w->hi = nr;
+  }
+
+  /* bisect: keep the lowest split, queue the rest in halves for thieves */
+  while (w->hi - w->lo > 1) {
+    uint32_t mid = w->lo + (w->hi - w->lo) / 2;
+    work_t rest = *w;
+    rest.lo = mid;
+    q_push(&rest);
+    w->hi = mid;
+  }
+
+  struct scan_ctx ctx = { .path = w->path, .path_len = strlen(w->path) };
+  rc = pfind_dfs_scan_split(dir, w->lo, runtime.needs_size, scan_cb, &ctx);
+  if (rc) {
+    res->errors++;
+    fprintf(stderr, "rank %d: scan of '%s' split %u failed: %s\n", pfind_rank, w->path, w->lo, strerror(rc));
+  }
+}
+
+/* ------------------------------------------------------------- driver */
+
+pfind_find_results_t *pfind_find(pfind_options_t *lopt){
+  opt = lopt;
+  memset(&runtime, 0, sizeof(runtime));
+
+  if (opt->delete_files || opt->delete_dirs || opt->uid != (uid_t)-1 || opt->gid != (uid_t)-1) {
+    if (pfind_rank == 0)
+      fprintf(stderr, "pfind-dfs: -e/-E/-uid/-gid are not supported by the DFS backend\n");
+    MPI_Abort(pfind_com, 1);
+  }
+
+  pfind_dfs_init(pfind_com);
+
+  if (opt->timestamp_file) {
+    if (pfind_rank == 0) {
+      struct stat timer_file;
+      if (lstat(opt->timestamp_file, &timer_file) != 0) {
+        fprintf(stderr, "Could not open: \"%s\", error: %s\n", opt->timestamp_file, strerror(errno));
+        MPI_Abort(pfind_com, 1);
+      }
+      runtime.ctime_min = timer_file.st_ctime;
+    }
+    MPI_Bcast(&runtime.ctime_min, 1, MPI_UINT64_T, 0, pfind_com);
+  }
+
+  if (opt->results_dir && !opt->just_count) {
+    char outfile[PATH_MAX];
+    snprintf(outfile, sizeof(outfile), "%s/%d.txt", opt->results_dir, pfind_rank);
     mkdir(opt->results_dir, S_IRWXU);
     runtime.logfile = fopen(outfile, "w");
-
-    if(runtime.logfile == NULL){
-      pfind_abort("Could not open output logfile!\n");
+    if (runtime.logfile == NULL) {
+      fprintf(stderr, "rank %d: could not open output logfile %s\n", pfind_rank, outfile);
+      MPI_Abort(pfind_com, 1);
     }
-  }else{
+  } else {
     runtime.logfile = stdout;
   }
 
-  // allocate sufficient large buffer size, we may receive up to size unexpected "stealing" calls
-  int bsend_size = (pfind_size + 1) * MPI_BSEND_OVERHEAD;
-  char * bsend_buf = smalloc( bsend_size );
-  MPI_Buffer_attach( bsend_buf, bsend_size );
+  runtime.needs_size = opt->size != UINT64_MAX;
+  runtime.client_regex = opt->name_pattern != NULL && opt->name_like == NULL;
 
-  if(opt->timestamp_file || opt->size != UINT64_MAX || opt->uid != (uid_t) -1 || opt->gid != (uid_t) -1){
-    runtime.needs_stat = 1;
-  }
-  //ior_aiori_t * backend = aiori_select(opt->backend_name);
-  work = smalloc(sizeof(work_t) * (opt->queue_length + 1 ));
-  double start = MPI_Wtime();
-  char * err = realpath(opt->workdir, start_dir);
-  res = smalloc(sizeof(pfind_find_results_t));
-  memset(res, 0, sizeof(*res));
+  int rc = pfind_dfs_set_filter(runtime.ctime_min, opt->name_like);
+  if (rc)
+    MPI_Abort(pfind_com, 1);
 
-  #ifdef LZ4
-    int max_compressed = LZ4_COMPRESSBOUND(opt->queue_length * sizeof(work_t) / 2);
-    char * compress_buf = smalloc(max_compressed);
-  #endif
+  res = smalloc(sizeof(*res));
+  q_cap = 0;
+  q = NULL;
+  q_reserve(opt->queue_length > 0 ? (size_t)opt->queue_length : 1024);
+  rand_seed = (unsigned)pfind_rank * 2654435761u + 12345u;
 
-  if(opt->stonewall_timer != 0){
+  items_sent = items_recv = 0;
+  dirty = 0;
+  term_have_prev = 0;
+  term_last = 0;
+  failed_steals = 0;
+  backoff_until = 0;
+
+  if (opt->stonewall_timer)
     runtime.stonewall_endtime = MPI_Wtime() + opt->stonewall_timer;
-  }else{
-    runtime.stonewall_endtime = 0;
+
+  MPI_Barrier(pfind_com);
+  double start = MPI_Wtime();
+
+  if (pfind_rank == 0) {
+    work_t root = { .lo = 0, .hi = 0 };
+    if (strlen(opt->workdir) >= sizeof(root.path)) {
+      fprintf(stderr, "workdir path too long (>%d)\n", PFIND_PATH_MAX);
+      MPI_Abort(pfind_com, 1);
+    }
+    strcpy(root.path, opt->workdir);
+    q_push(&root);
   }
 
-  DIR * sd = opendir(start_dir);
-  if (err == NULL || ! sd) {
-      fprintf (stderr, "Pfind: cannot open directory '%s': %s\n", start_dir, strerror (errno));
-      free(work);
-      free(res);
-      pfind_abort("");
+  while (1) {
+    double now = MPI_Wtime();
+
+    if (opt->stonewall_timer && !runtime.stonewall_hit && now >= runtime.stonewall_endtime) {
+      runtime.stonewall_hit = 1;
+      q_clear();
+      if (opt->verbosity > 1)
+        fprintf(runtime.logfile, "Hit stonewall at %.2fs\n", now - start);
+    }
+
+    work_t w;
+    if (!runtime.stonewall_hit && q_pop(&w))
+      process_item(&w);
+
+    serve_steal_requests();
+    reap_resp_sends(0);
+    progress_steal();
+    maybe_steal(MPI_Wtime());
+
+    if (progress_termination(q_count() > 0, MPI_Wtime()))
+      break;
   }
-  start_dir_length = strlen(start_dir);
 
-  // startup, load current directory
-  if(pfind_rank == 0){
-    work[0].type = 'd';
-    work[0].name[0] = 0;
-    pending_work++;
+  /*
+   * Shutdown: finish our own pending steal (victims keep serving until the
+   * barrier completes, and nobody enters the barrier with a request in
+   * flight), then keep serving until everyone is here.
+   */
+  while (steal_victim >= 0) {
+    serve_steal_requests();
+    reap_resp_sends(0);
+    progress_steal();
   }
-
-  int have_finalize_token = (pfind_rank == 0);
-  // a token indicating that I'm msg_type and other's to the left
-  int have_processed_work_after_token = 1;
-  int phase = 0; // 1 == potential cleanup; 2 == stop query; 3 == terminate
-
-  while(! msg_type_flag){
-    //usleep(100000);
-    int have_completed = (pending_work == 0 && excess_dirs.size == 0 && current_dir.dir == NULL);
-    debug("[%d] processing: %d [%d, %d, phase: %d]\n", pfind_rank, pending_work, have_finalize_token, have_processed_work_after_token, phase);
-    // do we have more work?
-    if(! have_completed){
-      if (opt->stonewall_timer && MPI_Wtime() >= runtime.stonewall_endtime ){
-        if(opt->verbosity > 1){
-          printf("Hit stonewall at %.2fs\n", MPI_Wtime());
-        }
-        pending_work = 0;
-      }else{
-        find_process_one_item();
-      }
-    }
-
-    int has_msg;
-    // try to retrieve token from a neighboring process
-    int left_neighbor = pfind_rank == 0 ? pfind_size - 1 : (pfind_rank - 1);
-    ret = MPI_Iprobe(left_neighbor, MSG_COMPLETE, pfind_com, & has_msg, MPI_STATUS_IGNORE);
-    CHECK_MPI
-    if(has_msg){
-      ret = MPI_Recv(& phase, 1, MPI_INT, left_neighbor, MSG_COMPLETE, pfind_com, MPI_STATUS_IGNORE);
-      CHECK_MPI
-      have_finalize_token = 1;
-      debug("[%d] recvd finalize token\n", pfind_rank);
-    }
-
-    // we msg_type our last piece of work
-    if (have_completed){
-      // Exit condition requesting_rank
-      if (have_finalize_token){
-        if (have_processed_work_after_token){
-          phase = 0;
-        }else if(pfind_rank == 0){
-          phase++;
-        }
-        if( pfind_size == 1){
-          break;
-        }
-        // send the finalize token to the right process
-        debug("[%d] forwarding token\n", pfind_rank);
-        int right_proc = (pfind_rank + 1);
-        if (right_proc == pfind_size){
-          right_proc = 0;
-          if(phase == 3){ // we are done, no need to pass along completion token
-            break;
-          }
-        }
-        ret = MPI_Bsend(& phase, 1, MPI_INT, right_proc, MSG_COMPLETE, pfind_com);
-        CHECK_MPI
-        res->monitor.completion_tokens_send++;
-        // we received the finalization token
-        if (phase == 3){
-          break;
-        }
-        have_processed_work_after_token = 0;
-        have_finalize_token = 0;
-      }
-    }
-
-    MPI_Status wait_status;
-    // check for job-stealing request
-    has_msg = 1;
-    while(has_msg){
-      ret = MPI_Iprobe(MPI_ANY_SOURCE, MSG_JOB_STEAL, pfind_com, & has_msg, & wait_status);
-      CHECK_MPI
-      if(has_msg){
-        int requesting_rank = wait_status.MPI_SOURCE;
-        ret = MPI_Recv(NULL, 0, MPI_INT, requesting_rank, MSG_JOB_STEAL, pfind_com, & wait_status);
-        CHECK_MPI
-        debug("[%d] msg ready from %d !\n", pfind_rank, requesting_rank);
-
-        int work_to_give = (pending_work == 1) ? (pending_work) : (pending_work / 2);
-        if(opt->parallel_single_dir_access && pending_work == 0 && current_dir.dir != NULL){
-          // the current node keeps the current position but updates the end
-          // the requester receives new position and updates position.
-          uint64_t dir_new_end = 0;
-
-          if(opt->parallel_single_dir_access == 1){
-            uint64_t dir_span;
-            dir_span = (current_dir.pos_end - current_dir.pos_cur) / 2;
-            dir_new_end = current_dir.pos_cur + dir_span;
-          }else if(opt->parallel_single_dir_access == 2){
-            dir_new_end = current_dir.pos_cur + opt->max_entries_per_iter;
-          }else{
-            printf("Error INVALID option for parallel access!\n");
-            exit(1);
-          }
-
-          strcpy(work[0].name, current_dir.name);
-          work[0].type = 'd';
-          work[0].dir_start = dir_new_end;
-          work[0].dir_end = current_dir.pos_end;
-
-          current_dir.pos_end = dir_new_end;
-          work_to_give = 1;
-          pending_work = 1;
-
-          debug("[%d] splitting the directory into two equal-sized fragments: %llu-%llu and %llu-%llu\n", pfind_rank, (long long unsigned) (long long unsigned) work[0].dir_start, (long long unsigned) work[0].dir_end, (long long unsigned) current_dir.pos_cur, (long long unsigned)  current_dir.pos_end);
-        }
-
-        res->monitor.job_steal_inbound++;
-        res->monitor.work_send += work_to_give;
-
-        int datasize = sizeof(work_t)*work_to_give;
-        pending_work -= work_to_give;
-
-        #ifndef LZ4
-          ret = MPI_Send(& work[pending_work], datasize, MPI_CHAR, requesting_rank, MSG_JOB_STEAL_RESPONSE, pfind_com);
-
-        #else
-
-        if(datasize > 0){
-          int compressed_size;
-          compressed_size = LZ4_compress_default((char*) & work[pending_work], compress_buf, datasize, max_compressed);
-          ret = MPI_Send(compress_buf, compressed_size, MPI_CHAR, requesting_rank, MSG_JOB_STEAL_RESPONSE, pfind_com);
-        }else{
-          ret = MPI_Send(NULL, 0, MPI_CHAR, requesting_rank, MSG_JOB_STEAL_RESPONSE, pfind_com);
-        }
-        #endif
-        CHECK_MPI
-
-        // move excess directory queue into the regular queue
-        if(excess_dirs.size > 0){
-
-          int to_move = work_to_give < excess_dirs.size ? work_to_give : excess_dirs.size;
-          int ex_pos = excess_dirs.size - 1;
-          //printf("Move %d ex_pos: %d Move: %d\n", pending_work, ex_pos, to_move);
-          for(int i = 0 ; i < to_move; i++, pending_work++, ex_pos--){
-            work[pending_work].type = 'd';
-            work[pending_work].dir_start = 0;
-            strcpy(work[pending_work].name, excess_dirs.dirs[ex_pos].name);
-          }
-          excess_dirs.size -= to_move;
-        }
-      }
-    }
-
-    int work_received = 0;
-    int steal_neighbor = pfind_rank;
-    if (pending_work == 0 && current_dir.dir == NULL && phase < 2){
-      // send request for job stealing
-      if(opt->steal_from_next) {
-        steal_neighbor = ((rand() % 2) && (pfind_rank > 0)) ? pfind_rank - 1 : rand() % pfind_size;
-      }else{
-        steal_neighbor = rand() % pfind_size;
-      }
-      if(steal_neighbor != pfind_rank){
-        struct timeval t_start;
-        pfind_timer_start(& t_start);
-        res->monitor.job_steal_tries++;
-
-        debug("[%d] msg attempting to steal from %d\n", pfind_rank, steal_neighbor);
-        ret = MPI_Bsend(NULL, 0, MPI_INT, steal_neighbor, MSG_JOB_STEAL, pfind_com);
-        CHECK_MPI
-        // check for any pending work stealing request, too.
-        while(1){
-          ret = MPI_Iprobe(steal_neighbor, MSG_JOB_STEAL_RESPONSE, pfind_com, & has_msg, & wait_status);
-          CHECK_MPI
-          if(has_msg){
-            MPI_Get_count(& wait_status, MPI_CHAR, & work_received);
-
-            #ifndef LZ4
-              ret = MPI_Recv(work, work_received, MPI_CHAR, steal_neighbor, MSG_JOB_STEAL_RESPONSE, pfind_com, MPI_STATUS_IGNORE);
-            #else
-            if(work_received > 0){
-              ret = MPI_Recv(compress_buf, work_received, MPI_CHAR, steal_neighbor, MSG_JOB_STEAL_RESPONSE, pfind_com, MPI_STATUS_IGNORE);
-              int decompressed_size = LZ4_decompress_safe (compress_buf, (char*)work, work_received, max_compressed);
-              //printf("Before: %d after: %d\n", datasize, compressed_size);
-              work_received = decompressed_size;
-            }else{
-              ret = MPI_Recv(work, work_received, MPI_CHAR, steal_neighbor, MSG_JOB_STEAL_RESPONSE, pfind_com, MPI_STATUS_IGNORE);
-            }
-            #endif
-            CHECK_MPI
-
-            work_received /= sizeof(work_t);
-            break;
-          }
-          // job stealing request
-          ret = MPI_Iprobe(MPI_ANY_SOURCE, MSG_JOB_STEAL, pfind_com, & has_msg, MPI_STATUS_IGNORE);
-          CHECK_MPI
-          if(has_msg){
-            res->monitor.job_steal_inbound++;
-            ret = MPI_Recv(NULL, 0, MPI_INT, MPI_ANY_SOURCE, MSG_JOB_STEAL, pfind_com, & wait_status);
-            CHECK_MPI
-            int requesting_rank = wait_status.MPI_SOURCE;
-            debug("[%d] msg ready from %d, but no work pending!\n", pfind_rank, requesting_rank);
-            ret = MPI_Send(NULL, 0, MPI_CHAR, requesting_rank, MSG_JOB_STEAL_RESPONSE, pfind_com);
-            CHECK_MPI
-          }
-        }
-        debug("[%d] stole %d \n", pfind_rank, work_received);
-        pending_work = work_received;
-        if (work_received > 0){
-          have_processed_work_after_token = 1;
-        }
-        res->monitor.work_stolen += work_received;
-
-        res->monitor.job_steal_mpitime_us += pfind_timer_diff_usec(& t_start);
-      }
+  {
+    MPI_Request bar;
+    int done = 0;
+    CHECK_MPI(MPI_Ibarrier(pfind_com, &bar));
+    while (!done) {
+      serve_steal_requests();
+      reap_resp_sends(0);
+      CHECK_MPI(MPI_Test(&bar, &done, MPI_STATUS_IGNORE));
     }
   }
-  debug("[%d] ended\n", pfind_rank);
-
-  #ifdef LZ4
-  free(compress_buf);
-  #endif
-
-  free(work);
-  MPI_Buffer_detach(bsend_buf, & bsend_size);
+  reap_resp_sends(1);
 
   double end = MPI_Wtime();
   res->runtime = end - start;
-
-  if(runtime.logfile != stdout){
-    fclose(runtime.logfile);
-  }
-
-  res->rate = res->total_files / res->runtime;
+  res->rate = res->runtime > 0 ? res->total_files / res->runtime : 0;
   res->com = pfind_com;
 
+  if (runtime.logfile != stdout)
+    fclose(runtime.logfile);
+  free(q);
+  q = NULL;
+  q_cap = q_head = q_tail = 0;
+
+  MPI_Barrier(pfind_com);
+  pfind_dfs_fini(pfind_com);
   return res;
 }
 
-pfind_find_results_t * pfind_aggregrate_results(pfind_find_results_t * local){
-  pfind_find_results_t * res = smalloc(sizeof(pfind_find_results_t));
-  if(! res){
-    pfind_abort("No memory");
-  }
-  memcpy(res, local, sizeof(*res));
+pfind_find_results_t *pfind_aggregrate_results(pfind_find_results_t *local){
+  pfind_find_results_t *res_tmp = smalloc(sizeof(pfind_find_results_t));
+  memcpy(res_tmp, local, sizeof(*res_tmp));
 
-  MPI_Reduce(pfind_rank == 0 ? MPI_IN_PLACE : & res->errors, & res->errors, 5, MPI_LONG_LONG_INT, MPI_SUM, 0, local->com);
-  MPI_Reduce(pfind_rank == 0 ? MPI_IN_PLACE : & res->runtime, & res->runtime, 1, MPI_DOUBLE, MPI_MAX, 0, local->com);
+  MPI_Reduce(pfind_rank == 0 ? MPI_IN_PLACE : &res_tmp->errors, &res_tmp->errors, 5,
+             MPI_LONG_LONG_INT, MPI_SUM, 0, local->com);
+  MPI_Reduce(pfind_rank == 0 ? MPI_IN_PLACE : &res_tmp->runtime, &res_tmp->runtime, 1,
+             MPI_DOUBLE, MPI_MAX, 0, local->com);
 
-  res->rate = res->total_files / res->runtime;
-  return res;
-}
-
-static char  find_file_type(unsigned char c) {
-    switch (c) {
-        case DT_BLK :
-            return 'b';
-        case DT_CHR :
-            return 'c';
-        case DT_DIR :
-            return 'd';
-        case DT_FIFO :
-            return 'F';
-        case DT_LNK :
-            return 'l';
-        case DT_REG :
-            return 'f';
-        case DT_SOCK :
-            return 's';
-        default :
-            return 'u';
-    }
-}
-
-static void check_buf(struct stat buf, char * path){
-    // compare values
-    if(opt->timestamp_file){
-      //printf("CMP %lld<%lld\n", buf.st_ctime, runtime.ctime_min);
-      if( (uint64_t) buf.st_ctime < runtime.ctime_min ){
-        if(opt->verbosity >= 2){
-          printf("Timestamp too small: %s\n", path);
-        }
-        return;
-      }
-    }
-    if(opt->size != UINT64_MAX){
-      uint64_t size = (uint64_t) buf.st_size;
-      if(size != opt->size){
-        if(opt->verbosity >= 2){
-          printf("Size does not match: %s has %zu bytes\n", path, (size_t) buf.st_size);
-        }
-        return;
-      }
-    }
-    if(opt->uid != (uid_t) -1){
-      if(buf.st_uid != opt->uid){
-        if(opt->verbosity >= 2){
-          printf("UID does not match: %s has %lld\n", path, (long long int) buf.st_uid);
-        }
-        return;
-      }
-    }    
-    if(opt->gid != (uid_t) -1){
-      if(buf.st_gid != opt->gid){
-        if(opt->verbosity >= 2){
-          printf("GID does not match: %s has %lld\n", path, (long long int) buf.st_gid);
-        }
-        return;
-      }
-    }    
-    if(! opt->just_count){
-      fprintf(runtime.logfile, "%s\n", path);
-    }
-    res->found_files++;
-    if(opt->delete_files){
-      if (unlink(path) != 0) {
-        res->errors++;
-        fprintf(runtime.logfile, "Error unlink file: %s\n", path);
-      }
-    }
-}
-
-static void find_do_lstat(char *path) {
-  char dir[PATH_MAX];
-  sprintf(dir, "%s/%s", start_dir, path);
-  struct stat buf;
-  // filename comparison has been done already
-  if(opt->verbosity >= 2){
-    printf("STAT: %s\n", dir);
-  }
-
-  res->total_files++;
-
-  if (lstat(dir, & buf) == 0) {
-    check_buf(buf, dir);
-  } else {
-    res->errors++;
-    fprintf(runtime.logfile, "Error stating file: %s\n", dir);
-  }
-}
-
-static int find_do_readdir(char *path, uint64_t dir_start, uint64_t dir_end) {
-    char dir[PATH_MAX];
-    sprintf(dir, "%s%s", start_dir, path);
-    path = & dir[start_dir_length];
-
-    DIR *d;
-    if( current_dir.dir ){
-      d = current_dir.dir;
-    }else{
-      d = opendir(dir);
-      if (!d) {
-          if(opt->verbosity > 1){
-            fprintf(runtime.logfile, "Cannot open '%s': %s\n", dir, strerror (errno));
-          }
-          res->errors++;
-          return 0;
-      }
-      if(opt->parallel_single_dir_access){
-        if(dir_start == 0 && dir_end == 0){
-          dir_end = LONG_MAX;
-        }
-        if(dir_start != 0){
-          seekdir(d, dir_start);
-        }
-      }
-    }
-    int fd = dirfd(d);
-    int processed = 0;
-
-    while (1) {
-        uint64_t pos = 0;
-        if(opt->parallel_single_dir_access){
-          pos = telldir(d);
-          debug("[%d] processing %llu\n", pfind_rank, (long long unsigned) pos);
-
-          if(pos < dir_start){
-            fprintf(runtime.logfile, "Error, telldir() returned smaller value, hashing doesn't work\n");
-            exit(1);
-          }
-          if(pos >= dir_end){
-            debug("[%d] reached end %llu >= %llu\n", pfind_rank, (long long unsigned) pos, (long long unsigned) dir_end);
-            // done processing with hashing
-            closedir(d);
-            current_dir.dir = NULL;
-            return 0;
-          }
-        }
-        //printf("find_do_readdir %s - %s\n", dir, path);
-        if(processed > opt->max_entries_per_iter){
-          debug("[%d] interrupting readdir\n", pfind_rank);
-          // break criteria to allow continuation of job stealing and such
-          if(current_dir.dir == NULL){
-            strcpy(current_dir.name, path);
-            current_dir.dir = d;
-          }
-          current_dir.pos_cur = pos;
-          current_dir.pos_end = dir_end;
-          return 1;
-        }
-        struct dirent *entry;
-        entry = readdir(d);
-        if (opt->stonewall_timer && MPI_Wtime() >= runtime.stonewall_endtime ){
-          if(opt->verbosity > 1){
-            fprintf(runtime.logfile, "Hit stonewall at %.2fs\n", MPI_Wtime());
-          }
-          break;
-        }
-        if (entry == NULL) {
-            break;
-        }
-        //debug("[%d] %s\n", pfind_rank, entry->d_name);
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-            continue;
-        }
-        res->checked_dirents++;
-        processed++;
-
-        char typ = find_file_type(entry->d_type);
-        if (typ == 'u'){
-          res->unknown_file++;
-          // sometimes the filetype is not provided by readdir.
-          struct stat buf;
-          if (fstatat(fd, entry->d_name, & buf, 0 )) {
-            res->errors++;
-            if(opt->verbosity > 1){
-              fprintf(runtime.logfile, "Error stating file: %s\n", dir);
-            }
-            continue;
-          }
-          typ = S_ISDIR(buf.st_mode) ? 'd' : 'f';
-
-          if(typ == 'f'){ // since we have done the stat already, it would be a waste to do it again
-            res->total_files++;
-            // compare values
-            if(opt->name_pattern && regexec(& opt->name_regex, entry->d_name, 0, NULL, 0) ){
-              if(opt->verbosity >= 2){
-                printf("Name does not match: %s\n", entry->d_name);
-              }
-              continue;
-            }
-            check_buf(buf, entry->d_name);
-            continue;
-          }
-        }else if (typ != 'd'){
-          // compare file name
-          if(opt->name_pattern && regexec(& opt->name_regex, entry->d_name, 0, NULL, 0) ){
-            res->total_files++;
-            if(opt->verbosity >= 2){
-              printf("Name does not match: %s\n", entry->d_name);
-            }
-            continue;
-          }
-          if(! runtime.needs_stat){
-            res->total_files++;
-            // optimization to skip stat
-            res->found_files++;
-            if(! opt->just_count){
-             fprintf(runtime.logfile, "%s/%s\n", dir, entry->d_name);
-            }
-            if(opt->delete_files){
-              if (unlinkat(fd, entry->d_name, 0) != 0) {
-                res->errors++;
-                fprintf(runtime.logfile, "Error unlink file: %s/%s\n", dir, entry->d_name);
-              }
-            }
-            continue;
-          }
-        }
-
-        // we need to perform a stat operation
-        if(enqueue_work(typ, path, entry->d_name)){
-          if(current_dir.dir == NULL){
-            strcpy(current_dir.name, path);
-            current_dir.dir = d;
-          }
-
-          if(typ == 'd'){
-            static int printed_warning = 0;
-            if(! printed_warning){
-              printf("[%d] WARNING, utilizing excess queue for processing of the directory %s as the queue is full, supressing further messages. This may lead to suboptimal performance. Try to increase the queue size.\n", pfind_rank, entry->d_name);
-              printed_warning = 1;
-            }
-            enqueue_dir_access(path, entry->d_name);
-          }else{
-            char cur_path[PATH_MAX];
-            sprintf(cur_path, "%s/%s", path, entry->d_name);
-            find_do_lstat(cur_path);
-          }
-          
-          pos = telldir(d);
-          current_dir.pos_cur = pos;
-          current_dir.pos_end = dir_end;
-
-          return 1;
-        }
-    }
-    closedir(d);
-    if(opt->delete_dirs){
-      rmdir(dir);
-      // check if the directory is empty
-      /* d = opendir(dir);
-      struct dirent *entry;
-      entry = readdir(d);
-      closedir(d);
-      */
-    }
-    current_dir.dir = NULL;
-    return 0;
+  res_tmp->rate = res_tmp->runtime > 0 ? res_tmp->total_files / res_tmp->runtime : 0;
+  return res_tmp;
 }
