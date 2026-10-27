@@ -222,7 +222,15 @@ static MPI_Request steal_req = MPI_REQUEST_NULL;
 static double steal_start;
 static int failed_steals;
 static double backoff_until;
-static unsigned int rand_seed;
+static uint64_t rng_state;
+
+/* splitmix64: uncorrelated streams for neighbouring rank seeds, unlike rand_r */
+static uint64_t rng_next(void){
+  uint64_t z = (rng_state += 0x9e3779b97f4a7c15ULL);
+  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+  return z ^ (z >> 31);
+}
 
 static void reap_resp_sends(int wait_all){
   struct resp_send **pp = &resp_list;
@@ -316,10 +324,10 @@ static void maybe_steal(double now){
     return;
 
   int victim;
-  if (opt->steal_from_next && pfind_rank > 0 && (rand_r(&rand_seed) & 1))
+  if (opt->steal_from_next && pfind_rank > 0 && (rng_next() & 1))
     victim = pfind_rank - 1;
   else
-    victim = (int)(rand_r(&rand_seed) % (unsigned)pfind_size);
+    victim = (int)(rng_next() % (uint64_t)pfind_size);
   if (victim == pfind_rank)
     victim = (victim + 1) % pfind_size;
 
@@ -567,7 +575,9 @@ pfind_find_results_t *pfind_find(pfind_options_t *lopt){
   q_cap = 0;
   q = NULL;
   q_reserve(opt->queue_length > 0 ? (size_t)opt->queue_length : 1024);
-  rand_seed = (unsigned)pfind_rank * 2654435761u + 12345u;
+  rng_state = 0x5851f42d4c957f2dULL ^ ((uint64_t)pfind_rank << 1);
+  for (int i = 0; i < 4; i++)
+    rng_next();
 
   items_sent = items_recv = 0;
   dirty = 0;

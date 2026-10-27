@@ -45,6 +45,13 @@ extern int pfind_rank;
 #define DIR_CACHE_BITS 12
 #define DIR_CACHE_SIZE (1u << DIR_CACHE_BITS)
 
+/*
+ * daos/object.h: DIOF_TO_SPEC_SHARD. dfs_obj_anchor_set() only tags the anchor
+ * with DIOF_TO_SPEC_GROUP; without the SHARD flag the pipeline client advances
+ * to the next shard on EOF and one "split" ends up walking the whole object.
+ */
+#define ANCHOR_FLAG_TO_SPEC_SHARD 0x2
+
 struct dir_cache_ent {
   char *path;
   dfs_obj_t *obj;
@@ -335,6 +342,7 @@ int pfind_dfs_scan_split(pfind_dir_t *dir, uint32_t split, int want_size,
   rc = dfs_obj_anchor_set(dir, split, &anchor);
   if (rc)
     return rc;
+  anchor.da_flags |= ANCHOR_FLAG_TO_SPEC_SHARD;
 
   while (!daos_anchor_is_eof(&anchor)) {
     uint32_t nr = SCAN_BATCH;
