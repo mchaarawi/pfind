@@ -6,7 +6,7 @@ DAOS=${MY_DAOS_INSTALL_PATH:-${DAOS_INSTALL_PATH:-/usr}}
 # Regular options, set on the command line CC
 CC="${CC:-mpicc}"
 CFLAGS="-g -O2 -Wextra -Wall -pipe -std=gnu99 -Wno-format-overflow -I$DAOS/include"
-LDFLAGS="-L$DAOS/lib64 -L$DAOS/lib -Wl,-rpath,$DAOS/lib64 -Wl,-rpath-link,$DAOS/lib64 -ldfs -ldaos -lgurt"
+LDFLAGS="-L$DAOS/lib64 -L$DAOS/lib -Wl,-rpath,$DAOS/lib64 -Wl,-rpath-link,$DAOS/lib64 -ldfs -ldaos -lgurt -lpthread"
 
 # Test settings
 #CC="${CC:-clang-10}"

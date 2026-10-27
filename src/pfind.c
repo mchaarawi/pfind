@@ -26,6 +26,8 @@
 #include <unistd.h>
 #include <assert.h>
 #include <regex.h>
+#include <pthread.h>
+#include <time.h>
 #include <mpi.h>
 
 #include "pfind-options.h"
@@ -40,6 +42,11 @@
 #define STEAL_BACKOFF_MIN   20e-6     /* seconds */
 #define STEAL_BACKOFF_MAX   5e-3
 #define TERM_WAVE_INTERVAL  10e-3
+#define TERM_FIELDS         6
+
+/* debugging knobs (seconds, 0 disables): PFIND_PROGRESS (rank 0), PFIND_WATCHDOG (any rank) */
+#define DEFAULT_PROGRESS_SEC 10
+#define DEFAULT_WATCHDOG_SEC 30
 
 int pfind_rank;
 int pfind_size;
@@ -66,6 +73,67 @@ static pfind_options_t *opt;
 static pfind_runtime_t runtime;
 static pfind_find_results_t *res;
 static int printed_warning;
+static double t_start;
+
+/* ------------------------------------------------------------ watchdog */
+
+static double mono_now(void){
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+enum { WD_IDLE = 0, WD_OPEN, WD_SPLIT, WD_SCAN };
+static const char *wd_names[] = { "idle", "dir_open", "nsplits", "scan" };
+static volatile int wd_state;
+static volatile double wd_op_start;
+static volatile uint64_t wd_batches;
+static volatile uint32_t wd_split;
+static char wd_path[PFIND_PATH_MAX];
+static volatile int wd_stop;
+static volatile int wd_steal_victim = -1;
+static volatile double wd_steal_start;
+static int wd_interval;
+static int progress_interval;
+static pthread_t wd_thread;
+
+static void wd_set(int state, const char *path, uint32_t split){
+  if (path != wd_path)
+    snprintf(wd_path, sizeof(wd_path), "%s", path);
+  wd_split = split;
+  wd_batches = 0;
+  wd_op_start = mono_now();
+  wd_state = state;
+}
+
+static void *watchdog_main(void *arg){
+  (void)arg;
+  double last_op_report = 0, last_steal_report = 0;
+  while (!wd_stop) {
+    struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+    nanosleep(&ts, NULL);
+    double now = mono_now();
+    int st = wd_state;
+    if (st != WD_IDLE && now - wd_op_start > wd_interval && now - last_op_report > wd_interval) {
+      fprintf(stderr, "[pfind wd] rank %d: %s '%s' split %u running for %.0fs (%lu batches done)\n",
+              pfind_rank, wd_names[st], wd_path, wd_split, now - wd_op_start,
+              (unsigned long)wd_batches);
+      last_op_report = now;
+    }
+    int v = wd_steal_victim;
+    if (v >= 0 && now - wd_steal_start > wd_interval && now - last_steal_report > wd_interval) {
+      fprintf(stderr, "[pfind wd] rank %d: steal request to rank %d unanswered for %.0fs\n",
+              pfind_rank, v, now - wd_steal_start);
+      last_steal_report = now;
+    }
+  }
+  return NULL;
+}
+
+static int env_seconds(const char *name, int def){
+  char *s = getenv(name);
+  return s ? atoi(s) : def;
+}
 
 /* ---------------------------------------------------------------- queue */
 
@@ -238,6 +306,7 @@ static void progress_steal(void){
     failed_steals++;
   }
   steal_victim = -1;
+  wd_steal_victim = -1;
 }
 
 static void maybe_steal(double now){
@@ -257,16 +326,40 @@ static void maybe_steal(double now){
   CHECK_MPI(MPI_Isend(NULL, 0, MPI_BYTE, victim, TAG_STEAL_REQ, pfind_com, &steal_req));
   steal_victim = victim;
   steal_start = now;
+  wd_steal_start = mono_now();
+  wd_steal_victim = victim;
   res->monitor.job_steal_tries++;
 }
 
 /* --------------------------------------------------- termination waves */
 
 static MPI_Request term_req = MPI_REQUEST_NULL;
-static uint64_t term_in[4], term_out[4];
+static uint64_t term_in[TERM_FIELDS], term_out[TERM_FIELDS], term_last_out[TERM_FIELDS];
 static uint64_t term_prev_sent, term_prev_recv;
 static int term_have_prev;
 static double term_last;
+static uint64_t waves_completed;
+static double last_progress;
+
+/* rank 0 only: periodic one-line status built from the last completed wave */
+static void progress_report(int final){
+  if (pfind_rank != 0 || !progress_interval)
+    return;
+  double now = MPI_Wtime();
+  if (!final && now - last_progress < progress_interval)
+    return;
+  last_progress = now;
+  fprintf(stderr, "[pfind] %s t=%.0fs waves=%lu last-wave: busy=%lu dirty=%lu steals-pending=%lu sent=%lu recv=%lu%s%lu"
+          " | rank0: q=%zu found=%lu scanned=%lu state=%s\n",
+          final ? "DONE" : "progress", now - t_start, (unsigned long)waves_completed,
+          (unsigned long)term_last_out[2], (unsigned long)term_last_out[3],
+          (unsigned long)term_last_out[4], (unsigned long)term_last_out[0],
+          (unsigned long)term_last_out[1],
+          term_last_out[2] == 1 ? " busy-rank=" : " busy-rank-sum=", (unsigned long)term_last_out[5],
+          q_count(), (unsigned long)res->found_files, (unsigned long)res->total_files,
+          wd_names[wd_state]);
+  fflush(stderr);
+}
 
 /* returns 1 when global termination has been detected */
 static int progress_termination(int busy, double now){
@@ -279,9 +372,11 @@ static int progress_termination(int busy, double now){
     term_in[1] = items_recv;
     term_in[2] = busy ? 1 : 0;
     term_in[3] = dirty ? 1 : 0;
+    term_in[4] = steal_victim >= 0 ? 1 : 0;
+    term_in[5] = busy ? (uint64_t)pfind_rank : 0;
     dirty = 0;
     term_last = now;
-    CHECK_MPI(MPI_Iallreduce(term_in, term_out, 4, MPI_UINT64_T, MPI_SUM, pfind_com, &term_req));
+    CHECK_MPI(MPI_Iallreduce(term_in, term_out, TERM_FIELDS, MPI_UINT64_T, MPI_SUM, pfind_com, &term_req));
     res->monitor.completion_tokens_send++;
     return 0;
   }
@@ -290,6 +385,9 @@ static int progress_termination(int busy, double now){
   if (!done)
     return 0;
 
+  memcpy(term_last_out, term_out, sizeof(term_out));
+  waves_completed++;
+  progress_report(0);
   int quiet = term_out[2] == 0 && term_out[3] == 0 && term_out[0] == term_out[1];
   int stable = term_have_prev && term_out[0] == term_prev_sent && term_out[1] == term_prev_recv;
   term_prev_sent = term_out[0];
@@ -363,9 +461,11 @@ static int scan_cb(pfind_entry_t *ents, uint32_t nr, uint64_t nr_scanned, void *
   }
 
   /* keep other ranks moving while this split is being scanned */
+  wd_batches++;
   serve_steal_requests();
   reap_resp_sends(0);
   progress_termination(1, MPI_Wtime());
+  progress_report(0);
 
   return opt->stonewall_timer && MPI_Wtime() >= runtime.stonewall_endtime;
 }
@@ -374,8 +474,10 @@ static void process_item(work_t *w){
   pfind_dir_t *dir;
   int rc;
 
+  wd_set(WD_OPEN, w->path, w->lo);
   rc = pfind_dfs_dir_open(w->path, &dir);
   if (rc) {
+    wd_state = WD_IDLE;
     res->errors++;
     if (opt->verbosity > 1)
       fprintf(runtime.logfile, "Cannot open '%s': %s\n", w->path, strerror(rc));
@@ -384,8 +486,10 @@ static void process_item(work_t *w){
 
   if (w->hi == 0) {
     uint32_t nr = 0;
+    wd_set(WD_SPLIT, wd_path, 0);
     rc = pfind_dfs_dir_nsplits(dir, &nr);
     if (rc || nr == 0) {
+      wd_state = WD_IDLE;
       res->errors++;
       fprintf(stderr, "rank %d: cannot split '%s': %s\n", pfind_rank, w->path, strerror(rc ? rc : EINVAL));
       return;
@@ -404,7 +508,9 @@ static void process_item(work_t *w){
   }
 
   struct scan_ctx ctx = { .path = w->path, .path_len = strlen(w->path) };
+  wd_set(WD_SCAN, wd_path, w->lo);
   rc = pfind_dfs_scan_split(dir, w->lo, runtime.needs_size, scan_cb, &ctx);
+  wd_state = WD_IDLE;
   if (rc) {
     res->errors++;
     fprintf(stderr, "rank %d: scan of '%s' split %u failed: %s\n", pfind_rank, w->path, w->lo, strerror(rc));
@@ -473,8 +579,26 @@ pfind_find_results_t *pfind_find(pfind_options_t *lopt){
   if (opt->stonewall_timer)
     runtime.stonewall_endtime = MPI_Wtime() + opt->stonewall_timer;
 
+  progress_interval = env_seconds("PFIND_PROGRESS", DEFAULT_PROGRESS_SEC);
+  wd_interval = env_seconds("PFIND_WATCHDOG", DEFAULT_WATCHDOG_SEC);
+  wd_state = WD_IDLE;
+  wd_stop = 0;
+  waves_completed = 0;
+  memset(term_last_out, 0, sizeof(term_last_out));
+  if (wd_interval > 0 && pthread_create(&wd_thread, NULL, watchdog_main, NULL) != 0) {
+    fprintf(stderr, "rank %d: could not start watchdog thread, continuing without\n", pfind_rank);
+    wd_interval = 0;
+  }
+
   MPI_Barrier(pfind_com);
   double start = MPI_Wtime();
+  t_start = start;
+  last_progress = start;
+  if (pfind_rank == 0 && progress_interval)
+    fprintf(stderr, "[pfind] start: %d ranks, workdir '%s', like='%s' newer=%lu size=%s progress=%ds watchdog=%ds\n",
+            pfind_size, opt->workdir, opt->name_like ? opt->name_like : "",
+            (unsigned long)runtime.ctime_min, runtime.needs_size ? "yes" : "no",
+            progress_interval, wd_interval);
 
   if (pfind_rank == 0) {
     work_t root = { .lo = 0, .hi = 0 };
@@ -507,7 +631,9 @@ pfind_find_results_t *pfind_find(pfind_options_t *lopt){
 
     if (progress_termination(q_count() > 0, MPI_Wtime()))
       break;
+    progress_report(0);
   }
+  progress_report(1);
 
   /*
    * Shutdown: finish our own pending steal (victims keep serving until the
@@ -530,6 +656,11 @@ pfind_find_results_t *pfind_find(pfind_options_t *lopt){
     }
   }
   reap_resp_sends(1);
+
+  if (wd_interval > 0) {
+    wd_stop = 1;
+    pthread_join(wd_thread, NULL);
+  }
 
   double end = MPI_Wtime();
   res->runtime = end - start;
