@@ -106,6 +106,26 @@ static void wd_set(int state, const char *path, uint32_t split){
   wd_state = state;
 }
 
+/* per-rank accounting for the end-of-run summary */
+static double   st_busy_sec;       /* time spent inside process_item */
+static uint64_t st_items;          /* items processed */
+static uint64_t st_scans;          /* splits scanned */
+static uint64_t st_rpcs;           /* readdir_with_filter batches */
+static double   st_max_op_sec;
+static char     st_max_op_path[PFIND_PATH_MAX];
+static uint32_t st_max_op_split;
+static uint64_t st_max_op_scanned;
+static uint64_t st_cur_scanned;
+
+static void st_op_done(const char *path, uint32_t split, double secs){
+  if (secs > st_max_op_sec) {
+    st_max_op_sec = secs;
+    st_max_op_split = split;
+    st_max_op_scanned = st_cur_scanned;
+    snprintf(st_max_op_path, sizeof(st_max_op_path), "%s", path);
+  }
+}
+
 static void *watchdog_main(void *arg){
   (void)arg;
   double last_op_report = 0, last_steal_report = 0;
@@ -422,6 +442,8 @@ static int scan_cb(pfind_entry_t *ents, uint32_t nr, uint64_t nr_scanned, void *
 
   res->checked_dirents += nr_scanned;
   res->total_files += nr_scanned;
+  st_cur_scanned += nr_scanned;
+  st_rpcs++;
 
   for (uint32_t i = 0; i < nr; i++) {
     pfind_entry_t *e = &ents[i];
@@ -481,11 +503,15 @@ static int scan_cb(pfind_entry_t *ents, uint32_t nr, uint64_t nr_scanned, void *
 static void process_item(work_t *w){
   pfind_dir_t *dir;
   int rc;
+  double t0 = mono_now();
 
+  st_items++;
+  st_cur_scanned = 0;
   wd_set(WD_OPEN, w->path, w->lo);
   rc = pfind_dfs_dir_open(w->path, &dir);
   if (rc) {
     wd_state = WD_IDLE;
+    st_busy_sec += mono_now() - t0;
     res->errors++;
     if (opt->verbosity > 1)
       fprintf(runtime.logfile, "Cannot open '%s': %s\n", w->path, strerror(rc));
@@ -498,12 +524,15 @@ static void process_item(work_t *w){
     rc = pfind_dfs_dir_nsplits(dir, &nr);
     if (rc || nr == 0) {
       wd_state = WD_IDLE;
+      st_busy_sec += mono_now() - t0;
       res->errors++;
       fprintf(stderr, "rank %d: cannot split '%s': %s\n", pfind_rank, w->path, strerror(rc ? rc : EINVAL));
       return;
     }
     w->lo = 0;
     w->hi = nr;
+    if (nr >= 256 && progress_interval)
+      fprintf(stderr, "[pfind] rank %d: '%s' has %u splits\n", pfind_rank, w->path, nr);
   }
 
   /* bisect: keep the lowest split, queue the rest in halves for thieves */
@@ -517,12 +546,50 @@ static void process_item(work_t *w){
 
   struct scan_ctx ctx = { .path = w->path, .path_len = strlen(w->path) };
   wd_set(WD_SCAN, wd_path, w->lo);
+  st_scans++;
   rc = pfind_dfs_scan_split(dir, w->lo, runtime.needs_size, scan_cb, &ctx);
   wd_state = WD_IDLE;
+  double secs = mono_now() - t0;
+  st_busy_sec += secs;
+  st_op_done(w->path, w->lo, secs);
   if (rc) {
     res->errors++;
     fprintf(stderr, "rank %d: scan of '%s' split %u failed: %s\n", pfind_rank, w->path, w->lo, strerror(rc));
   }
+}
+
+/* one-shot summary on rank 0: where did the time go */
+static void print_summary(double runtime_sec){
+  struct { double v; int rank; } loc_in = { st_max_op_sec, pfind_rank }, loc_out;
+  double sums_in[1] = { st_busy_sec }, sums_out[1];
+  uint64_t cnt_in[3] = { st_items, st_scans, st_rpcs }, cnt_out[3];
+  uint64_t max_in[1] = { st_scans }, max_out[1];
+  uint64_t min_in[1] = { st_scans }, min_out[1];
+  uint64_t zero_in[1] = { st_scans == 0 }, zero_out[1];
+
+  MPI_Reduce(sums_in, sums_out, 1, MPI_DOUBLE, MPI_SUM, 0, pfind_com);
+  MPI_Reduce(cnt_in, cnt_out, 3, MPI_UINT64_T, MPI_SUM, 0, pfind_com);
+  MPI_Reduce(max_in, max_out, 1, MPI_UINT64_T, MPI_MAX, 0, pfind_com);
+  MPI_Reduce(min_in, min_out, 1, MPI_UINT64_T, MPI_MIN, 0, pfind_com);
+  MPI_Reduce(zero_in, zero_out, 1, MPI_UINT64_T, MPI_SUM, 0, pfind_com);
+  MPI_Allreduce(&loc_in, &loc_out, 1, MPI_DOUBLE_INT, MPI_MAXLOC, pfind_com);
+
+  if (pfind_rank == 0) {
+    fprintf(stderr, "[pfind] summary: runtime %.1fs, utilization %.1f%% (busy %.0f rank-s of %.0f), "
+            "items %lu scans %lu rpcs %lu, scans/rank min %lu max %lu, ranks with no scan %lu, "
+            "steals: tries %lu ok %lu items moved %lu\n",
+            runtime_sec, 100.0 * sums_out[0] / (runtime_sec * pfind_size), sums_out[0],
+            runtime_sec * pfind_size, (unsigned long)cnt_out[0], (unsigned long)cnt_out[1],
+            (unsigned long)cnt_out[2], (unsigned long)min_out[0], (unsigned long)max_out[0],
+            (unsigned long)zero_out[0], (unsigned long)res->monitor.job_steal_tries,
+            (unsigned long)res->monitor.work_stolen, (unsigned long)items_recv);
+  }
+  if (pfind_rank == loc_out.rank)
+    fprintf(stderr, "[pfind] longest single op: rank %d %.2fs '%s' split %u (%lu entries scanned in it); "
+            "this rank: busy %.1fs items %lu scans %lu rpcs %lu\n",
+            pfind_rank, st_max_op_sec, st_max_op_path, st_max_op_split,
+            (unsigned long)st_max_op_scanned, st_busy_sec, (unsigned long)st_items,
+            (unsigned long)st_scans, (unsigned long)st_rpcs);
 }
 
 /* ------------------------------------------------------------- driver */
@@ -676,6 +743,9 @@ pfind_find_results_t *pfind_find(pfind_options_t *lopt){
   res->runtime = end - start;
   res->rate = res->runtime > 0 ? res->total_files / res->runtime : 0;
   res->com = pfind_com;
+
+  if (progress_interval)
+    print_summary(res->runtime);
 
   if (runtime.logfile != stdout)
     fclose(runtime.logfile);
